@@ -324,7 +324,10 @@ impl App {
             notice_icon(&nc,22.0,22.0,a);
             let max=if is_water{125.0}else{195.0};
             nc.centered_text(43.0,14.0,&nc.fit(&a.title,11.0,W::Semibold,max),11.0,W::Semibold,theme::WHITE,H::Left);
-            nc.centered_text(43.0,30.0,&nc.fit(&a.body,10.5,W::Regular,max),10.5,W::Regular,theme::GRAY,H::Left);
+            // 在场横幅（身后有人 / 离屏幕太近了）正文也用白字，与时钟同白，黑底横幅上可读；
+            // 其它通知正文仍用灰字，不动。
+            let body_color = if a.title == "身后有人" || a.title == "离屏幕太近了" { theme::WHITE } else { theme::GRAY };
+            nc.centered_text(43.0,30.0,&nc.fit(&a.body,10.5,W::Regular,max),10.5,W::Regular,body_color,H::Left);
             if is_water {
                 if notice_button(&nc,181.0,12.0,62.0,"稍后","water-snooze"){self.last_reminder=self.t-self.settings.water_minutes as f64*60.0+600.0;self.notice=None;}
                 if notice_button(&nc,250.0,12.0,68.0,"喝一口","water-confirm"){self.notice=None;self.drink_water();}
@@ -956,6 +959,40 @@ impl App {
                             setting_row(ui,"提醒声音","喝水、待办和专注提醒",&mut self.settings.sound);
                             ui.separator();
                             setting_row(ui,"全屏时隐藏","游戏、视频和演示全屏时隐藏",&mut self.settings.hide_fullscreen);
+                        });
+                        settings_label(ui,"在场保护");
+                        settings_card(ui,|ui|{
+                            let old_enabled=self.presence_enabled;
+                            setting_row(ui,"在场保护","离开自动锁屏、身后有人提示、坐姿太近提示；一个开关管三项",&mut self.presence_enabled);
+                            if self.presence_enabled!=old_enabled {
+                                if self.presence_enabled { self.presence_start(); } else { self.presence_stop(); }
+                            }
+                            ui.separator();
+                            let mut delay=self.presence_lock_after_secs;
+                            if setting_number(ui,"离开后锁屏",&mut delay,10.0,120.0," 秒",5.0) {
+                                self.presence_lock_after_secs=delay;
+                                if self.presence_enabled { self.presence_stop(); self.presence_start(); }
+                            }
+                            ui.add_space(3.0);
+                            ui.label(egui::RichText::new(&self.presence_status).size(12.0).color(settings_color(ctx,Color32::from_gray(180),Color32::from_gray(75))));
+                            ui.add_space(3.0);
+                            ui.horizontal(|ui|{
+                                let baseline_text = if self.settings.posture_calibrated {
+                                    format!("坐姿标准：w{:.2} h{:.2}（已校准）", self.settings.posture_baseline_w, self.settings.posture_baseline_h)
+                                } else {
+                                    "坐姿标准：w0.16 h0.32（未校准，用默认距离）".to_string()
+                                };
+                                ui.label(egui::RichText::new(baseline_text).size(12.0).color(settings_color(ctx,Color32::from_gray(180),Color32::from_gray(75))));
+                                if ui.button("校准标准坐姿").clicked() {
+                                    if self.presence_calibrate_posture() {
+                                        self.say("已校准标准坐姿");
+                                    } else {
+                                        self.say("校准失败：当前没看到主人脸");
+                                    }
+                                }
+                            });
+                            ui.add_space(3.0);
+                            ui.label(egui::RichText::new("离开设定秒数后自动锁屏；身后有人、坐姿太近时只岛上提示，不锁屏、不静音。在场时岛上不显示常驻状态；离开倒计时 5 秒后才在岛上显示，5 秒内不显示；太黑/摄像头问题仍立即显示。开启后离开会自动锁屏，请确保能登录回来。").size(11.5).color(settings_color(ctx,Color32::from_gray(180),Color32::from_gray(75))));
                         });
                     }
                     1=>{

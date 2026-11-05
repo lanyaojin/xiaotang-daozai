@@ -416,6 +416,28 @@ pub struct App {
     pub(crate) updates: crate::updates::State,
     pub(crate) resident: bar::Motion,
     pub(crate) resident_power: (Option<u8>,bool),
+    /// M1 在场锁定（运行时状态，不写入 Settings 文件，每次启动默认关闭）。
+    pub presence_enabled: bool,
+    pub presence_lock_after_secs: f64,
+    pub presence_rx: Option<std::sync::mpsc::Receiver<crate::presence::PresenceSnapshot>>,
+    pub presence_handle: Option<std::thread::JoinHandle<()>>,
+    pub presence_snapshot: Option<crate::presence::PresenceSnapshot>,
+    pub presence_status: String,
+    /// 岛上在场状态上一次在顶栏实测的字宽（base.text_w，运行时，不持久）。
+    /// base_size() 没有 Card/画笔，无法直接实测，故用上一帧顶栏实测值＋余量；
+    /// 首帧无实测值时用按字类估算的宽裕上限兜底，避免药丸右缘裁掉“锁屏”。
+    pub presence_status_w: f32,
+    /// 岛上在场状态用：自本次开启以来是否见过主人（显示层本地状态，不进 Settings）。
+    /// 用于区分“从没见过主人”（显示“在场保护已开启”，不做假倒计时）和“主人刚离开 <5 秒”（5 秒门槛内不显示任何状态）。
+    pub presence_owner_ever_seen: bool,
+    /// M2 提示计时（运行时，不持久；用 self.t 计时，每帧评估，3 秒滞后防闪烁）。
+    pub presence_peeking_since: Option<f64>,
+    pub presence_peeking_shown: bool,
+    pub presence_peeking_clear_since: Option<f64>,
+    /// M3 坐姿提示计时（运行时，不持久；与 M2 同一套 3 秒滞后逻辑）。
+    pub presence_posture_since: Option<f64>,
+    pub presence_posture_shown: bool,
+    pub presence_posture_clear_since: Option<f64>,
 }
 
 impl App {
@@ -509,12 +531,258 @@ impl App {
             quota: crate::quota_ui::State::load(),
             updates: Default::default(),
             resident: Default::default(), resident_power:(None,false),
+            presence_enabled: false, presence_lock_after_secs: 30.0,
+            presence_peeking_since: None, presence_peeking_shown: false, presence_peeking_clear_since: None,
+            presence_posture_since: None, presence_posture_shown: false, presence_posture_clear_since: None,
+            presence_rx: None, presence_handle: None,
+            presence_snapshot: None, presence_status: "在场锁定未开启".into(), presence_status_w: 0.0, presence_owner_ever_seen: false,
         }
     }
 
     pub fn say(&mut self, msg: impl Into<String>) {
         self.toast = Some((msg.into(), self.t));
         self.toast_below = false;
+    }
+
+    /// M1 在场锁定：启动后台采样线程。线程里 should_lock 时已经调过一次
+    /// 锁屏并 reset，这里绝不再调 lock_workstation（不双重锁屏）。
+    pub fn presence_start(&mut self) {
+        if self.presence_rx.is_some() {
+            self.presence_enabled = true;
+            return;
+        }
+        let config = crate::presence::PresenceConfig {
+            lock_after_secs: self.presence_lock_after_secs,
+            ..Default::default()
+        };
+        let (rx, handle) = crate::presence::spawn_watcher(
+            config,
+            Box::new(crate::presence_backend::NokhwaCamera::new()),
+            Box::new(crate::presence_backend::WinRTFaceDetector::new()),
+        );
+        self.presence_rx = Some(rx);
+        self.presence_handle = Some(handle);
+        self.presence_enabled = true;
+        self.presence_status = "在场锁定已开启".into();
+    }
+
+    /// 停止在场锁定：先断开 Receiver（线程一拍内退出），再丢掉 JoinHandle
+    /// （不 join、不阻塞界面）。
+    pub fn presence_stop(&mut self) {
+        self.presence_rx = None;
+        self.presence_handle = None;
+        self.presence_enabled = false;
+        self.presence_snapshot = None;
+        self.presence_status = "在场锁定已关闭".into();
+        self.presence_status_w = 0.0;
+        self.presence_owner_ever_seen = false;
+        self.presence_peeking_since = None;
+        self.presence_peeking_shown = false;
+        self.presence_peeking_clear_since = None;
+        self.presence_remove_alert("身后有人");
+        self.presence_posture_since = None;
+        self.presence_posture_shown = false;
+        self.presence_posture_clear_since = None;
+        self.presence_remove_alert("离屏幕太近了");
+    }
+
+    fn presence_remove_alert(&mut self, title: &str) {
+        if self.notice.as_ref().is_some_and(|a| a.title == title) {
+            self.notice = None;
+        }
+        self.alerts.retain(|a| a.title != title);
+    }
+
+    /// M2 岛上提示：每帧评估（不只快照变化时），用 self.t 计 3 秒滞后。
+    /// 只提示、不锁屏、不静音；主人不在/太黑/摄像头无帧时不提示、只清提示。
+    fn presence_prompts(&mut self) {
+        if !self.presence_enabled {
+            return;
+        }
+        let snap = match &self.presence_snapshot {
+            Some(s) => s.clone(),
+            None => return,
+        };
+        let now = self.t;
+        // M2：主人＋旁人扰动持续 3 秒才提示，扰动消失持续 3 秒才清。
+        let peeking_active = snap.owner_present
+            && snap.disturbance
+            && snap.other_faces > 0
+            && !snap.paused_dark
+            && snap.camera_available;
+        if peeking_active {
+            self.presence_peeking_clear_since = None;
+            if self.presence_peeking_since.is_none() {
+                self.presence_peeking_since = Some(now);
+            }
+            let since = self.presence_peeking_since.unwrap_or(now);
+            if now - since >= 3.0 {
+                // 重推同名提示可刷新岛上通知的 8 秒有效期，提示在条件持续时不消失。
+                self.alert("身后有人", "身后有人", 0, false);
+                self.presence_peeking_shown = true;
+            }
+        } else {
+            self.presence_peeking_since = None;
+            if self.presence_peeking_shown {
+                if self.presence_peeking_clear_since.is_none() {
+                    self.presence_peeking_clear_since = Some(now);
+                }
+                if now - self.presence_peeking_clear_since.unwrap_or(now) >= 3.0 {
+                    self.presence_remove_alert("身后有人");
+                    self.presence_peeking_shown = false;
+                    self.presence_peeking_clear_since = None;
+                }
+            }
+        }
+        // M3：只看主人框（不用最大脸，旁人再近也不触发主人坐姿提示）。
+        // 未校准时用默认 0.16/0.32；超 1.3 倍持续 3 秒提示，回落到 1.15 倍持续 3 秒才清。
+        let (bw, bh) = if self.settings.posture_calibrated {
+            (self.settings.posture_baseline_w, self.settings.posture_baseline_h)
+        } else {
+            (0.16, 0.32)
+        };
+        let too_close = snap.owner_present
+            && !snap.paused_dark
+            && snap.camera_available
+            && snap.owner_box.is_some_and(|b| b.w > bw * 1.3 || b.h > bh * 1.3);
+        if too_close {
+            self.presence_posture_clear_since = None;
+            if self.presence_posture_since.is_none() {
+                self.presence_posture_since = Some(now);
+            }
+            if now - self.presence_posture_since.unwrap_or(now) >= 3.0 {
+                self.alert("离屏幕太近了", "离屏幕太近了", 0, false);
+                self.presence_posture_shown = true;
+            }
+        } else {
+            self.presence_posture_since = None;
+            if self.presence_posture_shown {
+                if self.presence_posture_clear_since.is_none() {
+                    self.presence_posture_clear_since = Some(now);
+                }
+                let back = snap.owner_box.map_or(true, |b| b.w < bw * 1.15 && b.h < bh * 1.15);
+                if back && now - self.presence_posture_clear_since.unwrap_or(now) >= 3.0 {
+                    self.presence_remove_alert("离屏幕太近了");
+                    self.presence_posture_shown = false;
+                    self.presence_posture_clear_since = None;
+                }
+            }
+        }
+    }
+
+    /// M3 坐姿校准：以当前主人框为标准坐姿，持久化到 Settings；当前框按定义不算太近，顺带清掉旧提示。
+    /// 没主人框时返回 false，不改基线（避免把空帧存成标准）。
+    pub fn presence_calibrate_posture(&mut self) -> bool {
+        let Some(b) = self.presence_snapshot.as_ref().and_then(|s| s.owner_box) else {
+            return false;
+        };
+        self.settings.posture_baseline_w = b.w.clamp(0.05, 0.60);
+        self.settings.posture_baseline_h = b.h.clamp(0.10, 0.90);
+        self.settings.posture_calibrated = true;
+        self.settings.save();
+        self.presence_posture_since = None;
+        self.presence_posture_shown = false;
+        self.presence_posture_clear_since = None;
+        self.presence_remove_alert("离屏幕太近了");
+        true
+    }
+
+    /// 岛上在场状态（显示层，不走 Alert 通知槽，避免挤占“身后有人 / 离屏幕太近了”提示）。
+    /// 文案与设置页状态同源（同一快照字段），岛上只在需要提示时显示一行短版：
+    /// - 开启但还没快照 / 从没见过主人：显示“在场保护已开启”，不做假倒计时；
+    /// - 太黑 / 摄像头无帧：立即显示，不受 5 秒门槛影响（它们不是倒计时）；
+    /// - 主人在：不显示（在场是正常工作态，常驻显示是干扰；旁人由 3 秒后“身后有人”横幅提示）；
+    /// - 主人不在：只有 away_secs >= 5.0 才显示“离开中，还剩 X 秒锁屏”；
+    ///   5 秒内不显示任何状态（不显示假“主人在”，也不闪倒计时），短暂离开/误检不产生无效显示。
+    ///   门槛只管岛上倒计时显示，不改锁屏时间（仍是用户滑条，默认 30 秒）、不改偷窥/坐姿 3 秒门槛、不改 presence.rs 计秒与锁屏逻辑。
+    pub fn presence_island_status(&self) -> Option<(String, egui::Color32)> {
+        if !self.presence_enabled {
+            return None;
+        }
+        let Some(snap) = &self.presence_snapshot else {
+            return Some(("在场保护已开启".to_string(), theme::WHITE));
+        };
+        if snap.paused_dark {
+            return Some(("太黑已暂停".to_string(), theme::WHITE));
+        }
+        if !snap.camera_available {
+            return Some(("摄像头不可用".to_string(), theme::WHITE));
+        }
+        if !self.presence_owner_ever_seen {
+            return Some(("在场保护已开启".to_string(), theme::WHITE));
+        }
+        if snap.owner_present {
+            // 在场不显示：正常工作态不需要常驻状态，旁人由“身后有人”横幅提示。
+            return None;
+        }
+        // 主人不在：5 秒门槛，门槛内不显示任何状态（不显示假“主人在”，也不闪倒计时）。
+        if snap.away_secs < 5.0 {
+            return None;
+        }
+        Some((
+            format!("离开中，还剩 {:.0} 秒锁屏", snap.countdown_secs),
+            // 与顶栏时钟同白（theme::WHITE），不用黄色警告色，岛上更协调；
+            // 识别靠文案“离开中，还剩 X 秒锁屏”＋Semibold 字重，不靠颜色。
+            // 且它仍在顶栏小字区、不是 Alert 横幅——横幅只属于“身后有人 / 离屏幕太近了”这类瞬时提示，位置/尺寸/时长都不同，不会混淆。
+            theme::WHITE,
+        ))
+    }
+
+    /// 每帧轮询：把最新快照存下来，不调锁屏。返回快照是否变过。
+    pub fn presence_poll(&mut self) -> bool {
+        let mut changed = false;
+        let mut disconnected = false;
+        if let Some(rx) = &self.presence_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(snap) => {
+                        self.presence_snapshot = Some(snap);
+                        changed = true;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if disconnected {
+            self.presence_rx = None;
+            self.presence_handle = None;
+            self.presence_enabled = false;
+            self.presence_status = "在场线程已退出，请重新开启".into();
+            self.presence_owner_ever_seen = false;
+            self.presence_peeking_since = None;
+            self.presence_peeking_shown = false;
+            self.presence_peeking_clear_since = None;
+            self.presence_remove_alert("身后有人");
+            self.presence_posture_since = None;
+            self.presence_posture_shown = false;
+            self.presence_posture_clear_since = None;
+            self.presence_remove_alert("离屏幕太近了");
+        } else if changed {
+            if let Some(snap) = &self.presence_snapshot {
+                if snap.owner_present {
+                    self.presence_owner_ever_seen = true;
+                }
+                // 锁屏后 watcher 已 reset：下一批主人要重新认，岛上状态回到“已开启”而不是沿用旧主人。
+                if snap.should_lock {
+                    self.presence_owner_ever_seen = false;
+                }
+                self.presence_status = format!(
+                    "{} · 缺席 {:.0} 秒 · 还剩 {:.0} 秒 · {} · {} · 旁人 {}",
+                    if snap.owner_present { "主人在" } else { "主人不在" },
+                    snap.away_secs,
+                    snap.countdown_secs,
+                    if snap.paused_dark { "太黑已暂停" } else { "光线正常" },
+                    if snap.camera_available { "摄像头正常" } else { "摄像头无帧已暂停" },
+                    snap.other_faces
+                );
+            }
+        }
+        self.presence_prompts();
+        changed
     }
 
     pub(crate) fn code_copied(&mut self, code:&str) {
@@ -1057,6 +1325,28 @@ impl App {
     pub fn set_minimal(&mut self,enabled:bool) {
         self.settings.minimal=enabled;if enabled {self.settings.pet=false;}self.settings.save();
     }
+    /// 岛上在场状态药丸加宽的宽裕上限估算（仅首帧无实测值时用）。
+    /// 旧算法 chars*12+24 低估了 11px Semibold 中文字宽，实测“离开中，还剩 11 秒锁屏”
+    /// 在药丸右缘被裁掉末尾“锁屏”。按字类估算并留 25% 余量＋32 间距/边距：
+    /// 中文/全角 16、数字/拉丁 8、空格 5、其余 ASCII 6。
+    /// 最长倒计时“离开中，还剩 120 秒锁屏”估算：(8*16+16+3*8+2*5)*1.25+32 = 254.5，
+    /// 远高于旧算法 14*12+24 = 192，首帧绝不裁；稳态改用顶栏实测值，不会一直过宽。
+    fn presence_status_width_estimate(text: &str) -> f32 {
+        let mut w = 0.0f32;
+        for c in text.chars() {
+            w += if c == ' ' {
+                5.0
+            } else if c.is_ascii_digit() || c.is_ascii_alphabetic() {
+                8.0
+            } else if c.is_ascii() {
+                6.0
+            } else {
+                16.0
+            };
+        }
+        w * 1.25 + 32.0
+    }
+
     fn base_size(&self) -> (f32, f32) {
         if !self.compact_notices()&&!self.open {
             if let Some(a)=&self.notice {let (width,height)=self.notice_size(a);return (width+self.pet_space(),height);}
@@ -1065,6 +1355,15 @@ impl App {
             (self.lyric_bar_width(),BAR_H)
         } else if self.effective_minimal()&&self.t>=self.notification_bell_until {
             (BAR_W_MIN, BAR_H_MIN)
+        } else if !self.open && self.presence_island_status().is_some() {
+            // 岛上在场状态：收起药丸跟随歌词/通知先例自动加宽。
+            // base_size() 没有 Card/画笔，无法在此直接调 base.text_w；
+            // 故用顶栏上一帧实测值＋32（8 间距＋24 边距），首帧无实测值时用宽裕估算兜底。
+            // 展开时不走这支（面板宽已是 PW）；有通知横幅时走通知宽，状态让位给提示，不挤占提示。
+            let (text, _) = self.presence_island_status().unwrap();
+            let measured = self.presence_status_w + 32.0;
+            let status_w = measured.max(Self::presence_status_width_estimate(&text));
+            (self.resident.target.width + status_w, BAR_H)
         } else {
             (self.resident.target.width, BAR_H)
         }
@@ -1095,6 +1394,7 @@ impl App {
         let elapsed = self.last_t.map(|at| (env.t - at).max(0.0) as f32).unwrap_or(0.0);
         self.last_t = Some(env.t);
         self.t = env.t;
+        self.presence_poll();
         self.quota_tick();
         self.current_hour=env.hour();
         self.system_idle=env.idle_seconds;
@@ -1506,11 +1806,15 @@ impl App {
         let clock = env.clock.get(..5).unwrap_or("--:--").to_string();
         let show_battery=self.settings.show_battery && env.battery.is_some();
 
-        // 顶栏终点布局：[电池][日期][时钟] 作为一组整体居中
+        // 顶栏终点布局：[电池][日期][时钟][在场状态] 作为一组整体居中（在场状态跟随歌词/通知先例，收起药丸已在 base_size 里加宽，不裁剪）。
         let date_w = base.text_w(&env.date, size::DATE, W::Regular);
         let clock_w = base.text_w(&clock, size::CLOCK, W::Bold);
         let battery_space=if show_battery {24.0}else{0.0};
-        let group = battery_space + date_w + 8.0 + clock_w;
+        let presence_status = self.presence_island_status();
+        let presence_w = presence_status.as_ref().map(|(t, _)| base.text_w(t, size::DATE, W::Semibold)).unwrap_or(0.0);
+        // 供下一帧 base_size() 用：实测字宽才是药丸加宽的准确依据，估算只兜底首帧。
+        self.presence_status_w = presence_w;
+        let group = battery_space + date_w + 8.0 + clock_w + if presence_status.is_some() { 8.0 + presence_w } else { 0.0 };
         let gx = local_cx - group / 2.0 + if show_battery {6.0}else{0.0};
         let hb = (gx + 8.5, 18.6);
         let hd = gx + battery_space;
@@ -1540,6 +1844,16 @@ impl App {
         // 日期随内容淡入，从药丸方向轻轻滑出
         if reveal > 0.0 {
             base.faded(reveal).text(hd + (1.0 - reveal) * 10.0, 22.5, &env.date, size::DATE, W::Regular, Color32::from_rgb(210, 210, 214), H::Left);
+        }
+        // 岛上在场状态：跟随药丸时钟→顶栏时钟同一条形变路径滑动（收起时在药丸时钟右侧，展开时在顶栏时钟右侧），
+        // 不用 reveal 淡入——收起时就要可见。通知横幅时 shared_header 不画（走 draw_notice），状态让位给“身后有人 / 离屏幕太近了”提示，不挤占提示槽。
+        if let Some((presence_text, presence_color)) = &presence_status {
+            let pill_clock_w = base.text_w(&clock, size::PILL_CLOCK, W::Bold);
+            let pill_x = pcx + pill_clock_w + 8.0;
+            let header_x = hc + clock_w + 8.0;
+            let sx = lerp(pill_x, header_x, m);
+            let sy = lerp(21.0, 23.0, m);
+            base.text(sx, sy, presence_text, size::DATE, W::Semibold, *presence_color, H::Left);
         }
         if has_music && (p>0.1 || layout.x[bar::MUSIC].is_some()) {
             paint::playback_bars(base,lerp(local_cx+layout.x[bar::MUSIC].unwrap_or(0.0),367.0,m),lerp(15.0,18.0,m),self.t,self.media.playing,theme::WHITE);

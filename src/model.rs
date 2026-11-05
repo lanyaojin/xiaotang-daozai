@@ -117,11 +117,15 @@ pub struct Settings {
     /// 用户点开设置或关掉后置 false，不再弹。
     pub calendar_prompt: bool,
     pub calendar_auto_sync: bool,
+    /// M3 坐姿：标准坐姿主人框（归一化 w/h），校准后持久化；未校准时用默认 0.16/0.32。
+    pub posture_baseline_w: f32,
+    pub posture_baseline_h: f32,
+    pub posture_calibrated: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { settings_theme: Default::default(), pet: true, minimal: false, browser_minimal: false, visible_pages: [true; 8], page_order: [0,1,2,3,4,5,6,7], show_battery: true, resident_order: Vec::new(), system_hud: true, read_notifications:false, notifications: true, sound: false, lyrics_enabled:true, island_lyrics:false, lyric_delay_ms:-350, hide_fullscreen: true, focus_minutes: 25, rest_minutes: 5, water_minutes: 45, serving_ml: 250, water_start: 9, water_end: 22, mail_enabled: true, mail_code: true, mail_interval: 120, mail_ics: 15, ignored_mail_events: Vec::new(), calendar_prompt: true, calendar_auto_sync: true }
+        Self { settings_theme: Default::default(), pet: true, minimal: false, browser_minimal: false, visible_pages: [true; 8], page_order: [0,1,2,3,4,5,6,7], show_battery: true, resident_order: Vec::new(), system_hud: true, read_notifications:false, notifications: true, sound: false, lyrics_enabled:true, island_lyrics:false, lyric_delay_ms:-350, hide_fullscreen: true, focus_minutes: 25, rest_minutes: 5, water_minutes: 45, serving_ml: 250, water_start: 9, water_end: 22, mail_enabled: true, mail_code: true, mail_interval: 120, mail_ics: 15, ignored_mail_events: Vec::new(), calendar_prompt: true, calendar_auto_sync: true, posture_baseline_w: 0.16, posture_baseline_h: 0.32, posture_calibrated: false }
     }
 }
 
@@ -171,6 +175,9 @@ impl Settings {
                 "mail_ics" => s.mail_ics = match v.parse::<u32>().unwrap_or(15) { 5 => 5, 30 => 30, _ => 15 },
                 "calendar_prompt" => s.calendar_prompt = v != "0",
                 "calendar_auto_sync" => s.calendar_auto_sync = v != "0",
+                "posture_baseline_w" => s.posture_baseline_w = v.parse::<f32>().unwrap_or(0.16).clamp(0.05, 0.60),
+                "posture_baseline_h" => s.posture_baseline_h = v.parse::<f32>().unwrap_or(0.32).clamp(0.10, 0.90),
+                "posture_calibrated" => s.posture_calibrated = v == "1",
                 _ => {}
             }
         }
@@ -211,6 +218,9 @@ impl Settings {
                 ("ignored_mail_events".into(), serde_json::to_string(&self.ignored_mail_events).unwrap()),
                 ("calendar_prompt".into(), (self.calendar_prompt as u8).to_string()),
                 ("calendar_auto_sync".into(), (self.calendar_auto_sync as u8).to_string()),
+                ("posture_baseline_w".into(), self.posture_baseline_w.to_string()),
+                ("posture_baseline_h".into(), self.posture_baseline_h.to_string()),
+                ("posture_calibrated".into(), (self.posture_calibrated as u8).to_string()),
             ],
         );
     }

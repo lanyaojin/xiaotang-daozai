@@ -33,6 +33,8 @@ mod focus_bar;
 #[cfg(windows)]
 pub mod system;
 pub mod paint;
+pub mod presence;
+pub mod presence_backend;
 pub mod shape;
 pub mod smtc;
 pub mod theme;
