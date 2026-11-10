@@ -7,6 +7,7 @@ use crate::app::App;
 use crate::paint::{Card, H};
 use crate::theme::{self, W};
 use crate::presence::{Config, Tone};
+use eframe::egui;
 
 impl App {
     /// 设置窗口「常规」页里的在场保护卡片。由 extras.rs::settings_ui 调用。
