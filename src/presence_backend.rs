@@ -102,13 +102,13 @@ mod win {
             Self::downsample(&rgb, w, h)
         }
 
-        fn try_open(index: &nokhwa::utils::CameraIndex) -> Option<nokhwa::Camera> {
+        fn try_open(index: &nokhwa::utils::CameraIndex) -> Result<nokhwa::Camera, nokhwa::NokhwaError> {
             use nokhwa::pixel_format::RgbFormat;
             use nokhwa::utils::{RequestedFormat, RequestedFormatType};
             let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
-            let mut camera = nokhwa::Camera::new(index.clone(), requested).ok()?;
-            camera.open_stream().ok()?;
-            Some(camera)
+            let mut camera = nokhwa::Camera::new(index.clone(), requested)?;
+            camera.open_stream()?;
+            Ok(camera)
         }
     }
 
@@ -155,10 +155,15 @@ mod win {
     fn candidates() -> Vec<(nokhwa::utils::CameraIndex, String)> {
         use nokhwa::utils::ApiBackend;
         let mut found: Vec<(bool, nokhwa::utils::CameraIndex, String)> = Vec::new();
-        if let Ok(infos) = nokhwa::query(ApiBackend::Auto) {
-            for info in infos {
-                let name = info.human_name();
-                found.push((is_ir(&name), info.index().clone(), name));
+        match nokhwa::query(ApiBackend::Auto) {
+            Ok(infos) => {
+                for info in infos {
+                    let name = info.human_name();
+                    found.push((is_ir(&name), info.index().clone(), name));
+                }
+            }
+            Err(e) => {
+                crate::presence_backend::log(&format!("camera query failed, fallback to index 0..4: {e}"));
             }
         }
         found.sort_by_key(|(ir, _, _)| *ir);
@@ -174,13 +179,18 @@ mod win {
         stop: Arc<AtomicBool>,
         status: Arc<Mutex<SourceStatus>>,
     ) {
-        let _com = super::ComGuard::init();
+        // 不要在本线程做任何 COM/WinRT 初始化：nokhwa 的 Windows 绑定会自己调用
+        // CoInitializeEx(STA)；若先 RoInitialize(MTA)，STA 初始化得到 RPC_E_CHANGED_MODE，
+        // Media Foundation 的枚举与打开会全部失败（2026-11-10 本机实测）。
+        // WinRT 人脸检测线程（presence::run）不受影响，仍用 MTA。
         let mut devices = candidates();
         crate::presence_backend::log(&format!(
             "camera devices: {} (non-IR preferred)",
             devices.iter().map(|(_, n)| n.as_str()).collect::<Vec<_>>().join(" | ")
         ));
         let mut last_index = 0usize;
+        let mut fail_cycles: u32 = 0;
+        let mut last_fail_detail = String::new();
         loop {
             if stop.load(Ordering::Relaxed) { return; }
             let mut opened: Option<(nokhwa::Camera, String)> = None;
@@ -188,18 +198,40 @@ mod win {
                 if stop.load(Ordering::Relaxed) { return; }
                 let idx = (last_index + offset) % devices.len();
                 let (index, name) = &devices[idx];
-                if let Some(camera) = FrameSourceImpl::try_open(index) {
-                    last_index = idx;
-                    crate::presence_backend::log(&format!("camera opened: {name}"));
-                    opened = Some((camera, name.clone()));
-                    break;
+                match FrameSourceImpl::try_open(index) {
+                    Ok(camera) => {
+                        last_index = idx;
+                        if fail_cycles > 0 {
+                            crate::presence_backend::log(&format!(
+                                "camera opened after {fail_cycles} failed cycles: {name}"
+                            ));
+                        } else {
+                            crate::presence_backend::log(&format!("camera opened: {name}"));
+                        }
+                        fail_cycles = 0;
+                        last_fail_detail.clear();
+                        opened = Some((camera, name.clone()));
+                        break;
+                    }
+                    Err(e) => {
+                        // 失败原因只在变化时记一次，避免每秒重试刷爆日志。
+                        let detail = format!("camera open failed: {name}: {e}");
+                        if detail != last_fail_detail {
+                            crate::presence_backend::log(&detail);
+                            last_fail_detail = detail;
+                        }
+                    }
                 }
             }
             let Some((mut camera, name)) = opened else {
                 if let Ok(mut s) = status.lock() { s.ok = false; s.name = "摄像头无法打开".into(); }
-                crate::presence_backend::log("camera open failed, retry in 1s");
+                fail_cycles += 1;
+                // 每秒重试，但每 30 轮才记一条汇总；每 5 轮重新枚举一次设备。
+                if fail_cycles == 1 || fail_cycles % 30 == 0 {
+                    crate::presence_backend::log(&format!("all cameras failed, retrying (cycle {fail_cycles})"));
+                }
                 std::thread::sleep(Duration::from_secs(1));
-                devices = candidates();
+                if fail_cycles % 5 == 0 { devices = candidates(); }
                 continue;
             };
             loop {
