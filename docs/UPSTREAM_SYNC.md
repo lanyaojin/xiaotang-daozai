@@ -91,6 +91,45 @@ This section was appended manually by the weekly automation, not by the script.
 - TODO: branch.presence-v2 currently tracks upstream/main; consider setting it to origin/presence-v2.
 - TODO: tighten the overlap regex in sync-upstream.ps1 to exclude fluid.rs / native.rs false hits.
 
+## 2026-11-10 16:37 BLOCKED (manual automation record)
+NOTE: sync-upstream.ps1 -Push aborted at the clean-tree guard. No merge, build or push was run.
+This section was appended manually by the weekly automation, not by the script.
+
+- Command: scripts/sync-upstream.ps1 -Push
+- Fetch: upstream/main and origin fetched OK.
+- Failure: "Working tree is not clean. Commit or stash first:  M scripts/sync-upstream.ps1"
+- Dirty files (1): scripts/sync-upstream.ps1 (modified, uncommitted)
+- Root cause: external concurrent edit at 2026-11-10 16:36:58 (+28/-9 lines) adding
+  Test-MsvcLinker, so local cargo verification is skipped when the MSVC linker is absent
+  and the "Build presence" GitHub Actions workflow verifies after push instead. The edit
+  was NOT made by this automation and was not committed.
+- HEAD: dddc817 / upstream/main: f046d6c / origin/presence-v2: dddc817
+- HEAD..upstream/main: 0 new commits. merge-base(HEAD, upstream/main) == upstream/main,
+  so all 27 upstream commits of this week are ALREADY in the custom branch baseline.
+  No merge content is pending; a run after the tree is clean would be "Already up to date".
+- upstream/main..HEAD: 4 custom commits (presence v2 rewrite, gitignore, egui fix, docs).
+- Merge: NOT ATTEMPTED. No force, no auto-resolve, no commit, no stash, no checkout.
+- cargo check / cargo test presence: NOT RUN (script stopped before the build stage).
+  With the uncommitted Test-MsvcLinker change, local verification would also be skipped
+  when no MSVC linker is present, so the build result must be read from GitHub Actions.
+- Push: NOT RUN. origin/presence-v2 already equals HEAD, so no push is required this week.
+- FEATURE OVERLAP: NONE. upstream/main has no presence/camera/webcam/posture/face source
+  files, no nokhwa / FaceDetector / LockWorkStation / webcam dependency in Cargo.toml,
+  and no matching commit messages in the last 300 commits.
+- Script keyword-scan false positives (informational): src/fluid.rs (fluid-light test
+  variable "behind") and src/native.rs (DwmEnableBlurBehindWindow DWM glass API).
+- Custom features verified still present on HEAD: src/presence.rs constants
+  BEHIND_WHITE=1.0 / BEHIND_YELLOW=3.0 / BEHIND_RED=5.0, lock_after_secs=30.0,
+  posture_ratio=1.30; plus src/presence_backend.rs, src/presence_ui.rs, docs/PRESENCE.md,
+  .github/workflows/presence-build.yml, scripts/drop-presence.ps1.
+- DECISION: keep all custom presence code. Upstream has no equivalent implementation, so
+  scripts/drop-presence.ps1 -Confirm -Push is NOT recommended.
+- TODO: review and commit (or revert) the uncommitted scripts/sync-upstream.ps1 edit,
+  then re-run scripts/sync-upstream.ps1 -Push.
+- TODO: include docs/UPSTREAM_SYNC.md in the same commit (modified by this audit record).
+- TODO: after the guard passes, check the Build field: with Test-MsvcLinker it may report
+  "skipped-no-msvc-linker" and rely on the GitHub Actions workflow for verification.
+
 ## 2026-11-10 16:40 RESOLVED (manual record)
 
 The BLOCKED report above is historical and fully resolved:
@@ -101,3 +140,11 @@ The BLOCKED report above is historical and fully resolved:
 - The overlap regex no longer matches generic "behind"; known false-positive files are filtered.
 - Local cargo verification is intentionally skipped (no MSVC linker); CI is authoritative.
 - Remaining: real-machine verification of the three features with an actual camera.
+
+## 2026-11-10 16:39
+- Upstream: f046d6cb972ceeee99fd1c02aafcf6afc8ee6e80
+- New upstream commits: 0
+- Merge: merged
+- Build: skipped-no-msvc-linker (GitHub Actions verifies after push)
+- Push: no
+- Feature overlap: none detected
