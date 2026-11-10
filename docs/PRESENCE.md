@@ -63,7 +63,7 @@ MSIX 安装包约 652 MB、驱动约 151 MB，属于完整商业产品。本次�
 轻量性对比（本次实现）：
 
 - 采样 4 Hz、每帧 320×240 灰度约 75 KB，两名后台线程（采集 + 状态机），无模型文件、无驱动、不落盘图像；
-- 新增依赖仅 `nokhwa`（含 MJPEG 解码）与Windows 自带 WinRT 人脸检测，无 OpenCV / ONNX / 运行时；
+- 新增依赖仅 `nokhwa`（含 MJPEG 解码）与 Windows 自带 WinRT 人脸检测，无 OpenCV / ONNX / 运行时；
 - 设置与状态数据在 `%APPDATA%\Daozai\presence.txt`，与上游 settings 分离，便于合并。
 
 关于 Windows Hello 摄像头：本机枚举到 `Integrated Camera`（RGB）与 `Integrated IR Camera`
@@ -85,3 +85,40 @@ IR；设置页「状态」会显示实际打开的设备名。若后续决定以
 - 岛上出现「摄像头不可用」/「人脸检测不可用」/「画面太暗」：查看 `presence.log` 最后一行的设备打开与 FaceDetector 初始化结果；确认摄像头未被独占、光线充足、系统支持 WinRT 人脸检测。
 - 锁屏未触发：确认设置页状态显示「主人在座」曾经出现（没识别到主人不会布防），再离开座位观察倒计时。
 - 提示误报频繁：提高「身影检测阈值」，或在不需要时单独关闭「身后身影提示」。
+
+## 七、本机安装与实测清单
+
+构建产物来自 GitHub Actions「构建在场保护版本」，release 目标为
+`x86_64-pc-windows-msvc`；本机缺 MSVC 链接器，因此不要指望本地 `cargo build` 成功，
+以 CI 产物为准。
+
+安装（覆盖前必须备份，且先退出正在运行的岛仔）：
+
+```powershell
+$dest = "$env:LOCALAPPDATA\Programs\Daozai\daozai.exe"
+Copy-Item $dest "${dest}.bak-presence-v2" -Force
+Copy-Item "F:\Software Engineering\dist\daozai.exe" $dest -Force
+```
+
+岛仔是单实例程序（互斥体 `Local\Daozai.SingleInstance`），新旧 exe 不能同时运行，
+替换前需结束现有 `daozai` 进程再启动。也可设 `DAOZAI_DATA_DIR` 指向临时目录，
+用隔离配置做冒烟测试，不影响正式设置。
+
+实测顺序（先在设置 → 常规 → 在场保护打开总开关，确认状态栏显示实际摄像头名）：
+
+1. **摄像头链路**：状态应显示设备名（本机预期 `Integrated Camera`）与「主人在座」；
+   若显示诊断横幅，先看 `%APPDATA%\Daozai\presence.log`。
+2. **坐姿**：以正常坐姿点「以当前坐姿校准正常距离」→ 刻意靠近镜头并停留 2 秒 →
+   岛上出现黄色「离屏幕太近了，坐远一点」→ 坐回原位 2 秒后自动消失。
+   注意旧版把基线存在 `settings.txt`，新版存在 `presence.txt`，**需重新校准一次**。
+3. **离席**：保持被识别后离座 → 约 5 秒出现「离开中，还剩 N 秒锁屏」→
+   中途回座，倒计时应立即消失且之后不锁屏；再次离座且不返回 → 约 30 秒锁屏。
+   测试时建议先把「锁屏秒数」调到 10–15 秒，避免等待过久。
+4. **身后身影**：保持主人在座，让另一人从身后经过 → 1 秒白字、3 秒黄字、
+   5 秒红字；各阶段点击横幅应立刻消除，人影消失后再次出现会重新提示。
+5. **安全底线**：用手完全遮住摄像头或关灯 → 岛上出现「画面太暗」类诊断，
+   离席计时冻结，不应锁屏。
+6. **资源**：任务管理器观察 `daozai` 的 CPU / 内存；关闭总开关后摄像头指示灯应熄灭。
+
+回滚：结束进程，把 `daozai.exe.bak-presence-v2` 复制回 `daozai.exe` 即可；
+`presence.txt` / `presence.log` 是独立文件，删除不影响原有岛仔设置。
