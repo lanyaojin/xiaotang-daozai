@@ -122,3 +122,39 @@ Copy-Item "F:\Software Engineering\dist\daozai.exe" $dest -Force
 
 回滚：结束进程，把 `daozai.exe.bak-presence-v2` 复制回 `daozai.exe` 即可；
 `presence.txt` / `presence.log` 是独立文件，删除不影响原有岛仔设置。
+
+## 八、2026-11-10 首次本机实测记录（已暂停，后续继续）
+
+### 时间线与证据
+
+| 时间 | 事件 | 证据 |
+|---|---|---|
+| 16:46 | 安装首个 CI 产物（19,048,960 B，v0.6.63），开启总开关 | 进程 PID 16452 |
+| 16:46–17:06 | 摄像头枚举退化为「摄像头 0..3」，4 个索引每秒重试全部打开失败；`FaceDetector ready (MTA)` 正常 | `%APPDATA%\Daozai\presence.log` |
+| 16:52 | 定位根因：`nokhwa-bindings-windows 0.4.6::initialize_mf()` 在采集线程调用 `CoInitializeEx(STA)`，而 `camera_loop` 先 `RoInitialize(MTA)`，STA 初始化返回 `RPC_E_CHANGED_MODE` | 绑定库源码 `lib.rs:179`；提交 `f9c643e` |
+| 17:07 | 修复版 CI 通过 | Actions run `42786053956`：逻辑测试 ✅ / release 构建 ✅ / 上传 ✅ |
+| 17:08 | 安装修复版（19,055,616 B，SHA256 `e9202f71…936e`），摄像头链路**成功** | 日志：`camera devices: Integrated Camera (non-IR preferred)` → `FaceDetector ready (MTA)` → `camera opened: Integrated Camera`；打开后 0 次帧失败、0 次重开、0 次打开失败 |
+| 约 17:10 | 进程静默退出：**无 WER 崩溃事件、无系统重启记录、日志无错误行** | `Get-WinEvent`（Application / System，近 30 分钟）为空 |
+| 17:13 | 带 stderr 重定向复现：存活 50 秒、stderr/stdout 均为空；但该启动方式使进程成为工具会话子进程，会话结束会被清理，**不能作为崩溃证据** | `dist\daozai-stderr.log` 0 字节 |
+| 17:15 | 回滚到已知稳定版并拉起 | 安装目录 `daozai.exe` = 19,263,488 B，SHA256 `2ccfbd67…7eb7`，与备份一致；进程 PID 23672 稳定运行 |
+
+### 结论与未决问题
+
+- **已验证成功**：COM 单元冲突修复有效。设备枚举恢复真实名称、RGB 摄像头成功打开、WinRT 人脸检测器在 MTA 线程初始化成功、打开后无帧错误。
+- **未决问题**：修复版在「成功采集帧之后的路径」出现一次进程静默退出，原因未定位。嫌疑方向：① `[profile.release] panic = "abort"` 使任意线程 panic 直接终止 GUI 进程且不留 WER 记录；② `DetectorImpl::detect()` 的 WinRT `DetectFacesAsync().get()` 或帧几何索引在真实帧数据下触发异常；③ 采集线程 STA 单元与 WinRT MTA 线程的交互。**也可能是外部看门狗 / 启动方式导致，尚未证实为崩溃**。
+- 旧版在同一台机器上带摄像头稳定运行 20 分钟以上，因此该问题与本次「成功打开摄像头」的新路径相关。
+
+### 当前机器状态（下班前）
+
+- `C:\Users\Lijin\AppData\Local\Programs\Daozai\daozai.exe` = **旧稳定版**（自动锁定功能可用），备份 `daozai.exe.bak-presence-v2` 同哈希。
+- 修复版 exe 保留在 `F:\Software Engineering\dist\daozai-v3.exe`，CI 产物 `daozai-presence-v3.zip`；旧 CI 版 `dist\daozai.exe`。
+- `%APPDATA%\Daozai\presence.txt` 的 `enabled=0`（防止修复版被误启动后自动开启摄像头）。**恢复开发时需改回 `enabled=1`**。
+- upstream remote 的 push 地址已禁用；所有提交只推送到自己的 fork `lanyaojin/xiaotang-daozai:presence-v2`。
+
+### 后续开发待办（按优先级）
+
+1. 抓退出证据：用 `Start-Process -PassThru` 启动修复版，轮询 `HasExited` / `ExitCode`；启用 WER `LocalDumps` 或检查 `diagnostics\` 目录，确认是 Rust panic、原生访问冲突还是正常退出。
+2. 因 `panic = "abort"`，`catch_unwind` **无法**兜底；需消除 panic 源，或评估将 presence 逻辑放到独立子进程，或为该版本改用 `panic = "unwind"`（会增加体积，与轻量化目标冲突，需权衡）。
+3. 重点审查 `presence_backend.rs::detect()` 的 `DataWriter` / `SoftwareBitmap(Gray8)` 尺寸、`faces.GetAt` 边界，以及 `presence.rs` 中 `GrayFrame::cells()`、`Watcher::motion()` 的网格索引（真实帧尺寸来自 `buffer.resolution()`，与解码 RGB 长度需一致）。
+4. 修复后重新走 CI（run 模板 `42786053956`）+ 本机至少 30 分钟稳定性观察，再按第七节清单由用户配合完成三项功能实测。
+5. 三项功能实测完成后，把结果补写进本节并同步到自己的 fork。
