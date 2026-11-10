@@ -53,6 +53,13 @@ pub mod smtc;
 pub mod theme;
 pub mod settings_theme;
 mod updates;
+// 在场保护（摄像头）：纯逻辑与 UI 状态平台无关，采集/检测后端仅 Windows。
+pub mod presence;
+mod presence_ui;
+#[cfg(windows)]
+pub mod presence_backend;
+#[cfg(not(windows))]
+mod presence_backend;
 #[cfg(windows)]
 pub use updates::record_install_size;
 

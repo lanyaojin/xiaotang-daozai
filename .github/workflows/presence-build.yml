@@ -1,0 +1,31 @@
+name: 构建在场保护版本
+
+on:
+  push:
+    branches: [ presence-v2 ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装 Rust stable
+        run: rustup toolchain install stable --profile minimal
+      - name: 安装 NASM（摄像头 MJPEG 解码依赖）
+        run: choco install nasm -y --no-progress
+      - name: 在场保护逻辑测试
+        run: cargo +stable test --locked presence -- --test-threads=1
+      - name: 构建 release 主程序
+        run: cargo +stable build --locked --release --bin daozai
+      - name: 上传可执行文件
+        uses: actions/upload-artifact@v4
+        with:
+          name: daozai-presence
+          path: target/release/daozai.exe
+          if-no-files-found: error

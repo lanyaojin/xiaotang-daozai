@@ -59,6 +59,9 @@ eframe = { version = "0.31", default-features = false, features = ["glow", "defa
 clipboard-win = "5.4.3"
 wgpu = { version = "24", default-features = false, features = ["dx12"] }
 memmap2 = "0.9.12"
+# 在场保护：摄像头采集（Media Foundation 原生后端）。保留默认 MJPEG 解码，
+# 与本机已验证可用的采集链路一致；构建需要 NASM（CI 中自动安装）。
+nokhwa = { version = "0.10", features = ["input-native"] }
 windows = { version = "0.58", features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
@@ -73,6 +76,10 @@ windows = { version = "0.58", features = [
   "Win32_System_Registry",
   "Win32_System_SystemInformation",
   "Win32_System_Threading",
+  # 在场保护：LockWorkStation 与 WinRT 人脸检测。
+  "Win32_System_Shutdown",
+  "Media_FaceAnalysis",
+  "Graphics_Imaging",
   "Win32_System_Diagnostics_ToolHelp",
   "Win32_Storage_FileSystem",
   "Win32_UI_Input_KeyboardAndMouse",

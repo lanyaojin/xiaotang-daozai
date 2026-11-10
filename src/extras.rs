@@ -1012,7 +1012,7 @@ pub(crate) fn settings_control_row(ui:&mut egui::Ui,title:&str,label_width:f32,c
         content
     }).inner
 }
-fn setting_number<N:egui::emath::Numeric>(ui:&mut egui::Ui,title:&str,value:&mut N,min:N,max:N,suffix:&str,speed:f64)->bool{
+pub(crate) fn setting_number<N:egui::emath::Numeric>(ui:&mut egui::Ui,title:&str,value:&mut N,min:N,max:N,suffix:&str,speed:f64)->bool{
     let mut changed=false;
     settings_control_row(ui,title,80.0,|ui|{
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{
@@ -1308,6 +1308,9 @@ impl App {
                             ui.separator();
                             setting_row(ui,"全屏时隐藏","游戏、视频和演示全屏时隐藏",&mut self.settings.hide_fullscreen);
                         });
+                        // 在场保护（摄像头）：卡片实现在 presence_ui.rs，这里只保留一个挂点。
+                        settings_label(ui,"在场保护");
+                        settings_card(ui,|ui|self.presence_settings(ui));
                     }
                     1=>{
                         settings_label(ui,"歌词");
