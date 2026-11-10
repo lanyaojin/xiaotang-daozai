@@ -13,3 +13,5 @@
 *.key
 .DS_Store
 Thumbs.db
+# WorkBuddy 本地会话数据（自动化记忆等），不进入仓库
+/.workbuddy/
