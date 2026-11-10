@@ -17,6 +17,21 @@ function Note([string]$line) {
     Add-Content -Path $report -Value $line -Encoding UTF8
 }
 
+# A local cargo build needs the real MSVC linker. Git Bash ships a GNU `link`
+# that rustc may pick up by mistake, which makes the check hang and fail.
+# When MSVC is absent we skip local verification and rely on the
+# "Build presence" GitHub Actions workflow after the push instead.
+function Test-MsvcLinker {
+    $link = Get-Command link.exe -ErrorAction SilentlyContinue
+    if (-not $link) { return $false }
+    foreach ($l in @($link)) {
+        try {
+            if ($l.FileVersionInfo.FileDescription -like '*Linker*') { return $true }
+        } catch { }
+    }
+    return $false
+}
+
 if (-not (Test-Path (Join-Path $Repo ".git"))) { throw "Not a git repository: $Repo" }
 
 git -C $Repo fetch upstream --prune
@@ -38,7 +53,10 @@ $upstreamSha = (git -C $Repo rev-parse "upstream/main").Trim()
 $newCommits = @(git -C $Repo log --oneline "$before..upstream/main")
 
 # Detect whether upstream has started to implement equivalent features.
-$overlap = @(git -C $Repo grep -il -E "nokhwa|FaceDetector|LockWorkStation|presence|webcam|posture|behind" "upstream/main" -- src Cargo.toml 2>$null)
+# `behind` is too generic: upstream fluid/native/model code uses it as an
+# ordinary English word and produced false overlap candidates in earlier runs.
+$overlapRaw = @(git -C $Repo grep -il -E "nokhwa|FaceDetector|LockWorkStation|presence|webcam|posture" "upstream/main" -- src Cargo.toml 2>$null)
+$overlap = @($overlapRaw | Where-Object { $_ -notmatch '(^|/)(fluid|native|side_dock|model|exchange)\.rs$' })
 
 $mergeResult = "already-up-to-date"
 if ($before -ne $upstreamSha) {
@@ -57,16 +75,20 @@ if ($before -ne $upstreamSha) {
 
 $buildResult = "skipped"
 if (-not $SkipBuild) {
-    $cargo = Join-Path $env:USERPROFILE ".cargo\bin\cargo.exe"
-    if (Test-Path $cargo) {
-        & $cargo check --locked --lib --manifest-path (Join-Path $Repo "Cargo.toml")
-        if ($LASTEXITCODE -ne 0) { $buildResult = "cargo-check-FAILED" }
-        else {
-            & $cargo test --locked presence --manifest-path (Join-Path $Repo "Cargo.toml") -- --test-threads=1
-            if ($LASTEXITCODE -ne 0) { $buildResult = "cargo-test-FAILED" } else { $buildResult = "OK" }
-        }
+    if (-not (Test-MsvcLinker)) {
+        $buildResult = "skipped-no-msvc-linker (GitHub Actions verifies after push)"
     } else {
-        $buildResult = "cargo-not-installed"
+        $cargo = Join-Path $env:USERPROFILE ".cargo\bin\cargo.exe"
+        if (Test-Path $cargo) {
+            & $cargo check --locked --lib --manifest-path (Join-Path $Repo "Cargo.toml")
+            if ($LASTEXITCODE -ne 0) { $buildResult = "cargo-check-FAILED" }
+            else {
+                & $cargo test --locked presence --manifest-path (Join-Path $Repo "Cargo.toml") -- --test-threads=1
+                if ($LASTEXITCODE -ne 0) { $buildResult = "cargo-test-FAILED" } else { $buildResult = "OK" }
+            }
+        } else {
+            $buildResult = "cargo-not-installed"
+        }
     }
 }
 

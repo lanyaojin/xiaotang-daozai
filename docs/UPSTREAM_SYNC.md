@@ -10,8 +10,8 @@
 1. `git fetch upstream` / `git fetch origin`。
 2. 运行 `scripts/sync-upstream.ps1 -Push`：把 `upstream/main` 合并进 `presence-v2`，保留自研提交。
 3. 扫描上游新增代码与提交说明，判断是否出现同类功能（摄像头、在场感知、坐姿、离席锁屏、身后人影）。
-4. 运行 `cargo test presence` 与 `cargo check` 验证。
-5. 追加同步报告到本文件末尾，并推送分支。
+4. 编译验证：**本机没有 MSVC 链接器，脚本会自动跳过本地 `cargo check` / `cargo test`**，改由推送后触发的 GitHub Actions「构建在场保护版本」完成（逻辑测试 + release 构建）。将来装了 MSVC 生成工具后，脚本会自动恢复本地验证。
+5. 追加同步报告到本文件末尾，并推送分支；自动任务随后查询最新 workflow run 的结论。
 6. 用中文汇报本周上游更新要点、合并结果、验证结果与待办事项。
 
 出现合并冲突时脚本会 `git merge --abort` 并保留现场，**不会自动覆盖**；自动任务会报告冲突文件，等待人工/后续处理。
@@ -22,7 +22,8 @@
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\sync-upstream.ps1 -Push
 ```
 
-可选参数：`-Repo <路径>`、`-Branch <分支>`、`-SkipBuild`（跳过编译验证）、不传 `-Push` 只做本地合并。
+可选参数：`-Repo <路径>`、`-Branch <分支>`、`-SkipBuild`（强制跳过编译验证）、不传 `-Push` 只做本地合并。
+脚本会自动检测 MSVC `link.exe`；检测不到时不会调用 `cargo`，避免误用 Git Bash 自带的 GNU `link` 导致编译挂住。
 
 ## 上游实现更好时，删除自研功能
 
@@ -89,3 +90,14 @@ This section was appended manually by the weekly automation, not by the script.
 - TODO: push origin presence-v2 (remote branch does not exist yet).
 - TODO: branch.presence-v2 currently tracks upstream/main; consider setting it to origin/presence-v2.
 - TODO: tighten the overlap regex in sync-upstream.ps1 to exclude fluid.rs / native.rs false hits.
+
+## 2026-11-10 16:40 RESOLVED (manual record)
+
+The BLOCKED report above is historical and fully resolved:
+
+- presence-v2 is committed and pushed (6fe0759, f549915, 4fb0d19, dddc817) and tracks origin/presence-v2.
+- "Build presence" GitHub Actions run 42780680446 is green (logic tests + release build + artifact upload).
+- daozai.exe (19,048,960 bytes, ProductVersion 0.6.63) downloaded to F:\Software Engineering\dist.
+- The overlap regex no longer matches generic "behind"; known false-positive files are filtered.
+- Local cargo verification is intentionally skipped (no MSVC linker); CI is authoritative.
+- Remaining: real-machine verification of the three features with an actual camera.
