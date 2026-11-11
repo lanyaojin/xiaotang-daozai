@@ -158,3 +158,59 @@ Copy-Item "F:\Software Engineering\dist\daozai.exe" $dest -Force
 3. 重点审查 `presence_backend.rs::detect()` 的 `DataWriter` / `SoftwareBitmap(Gray8)` 尺寸、`faces.GetAt` 边界，以及 `presence.rs` 中 `GrayFrame::cells()`、`Watcher::motion()` 的网格索引（真实帧尺寸来自 `buffer.resolution()`，与解码 RGB 长度需一致）。
 4. 修复后重新走 CI（run 模板 `42786053956`）+ 本机至少 30 分钟稳定性观察，再按第七节清单由用户配合完成三项功能实测。
 5. 三项功能实测完成后，把结果补写进本节并同步到自己的 fork。
+
+## 九、2026-11-11 下午：Glance 解包分析、误报修复与 v5 功能完善
+
+### Glance 11.19 解包分析
+
+完成只读解包与逆向（未安装、未运行）：787 MB / 973 文件，Qt6 + OpenCV 4.8.1 +
+TensorFlow Lite + 私有 NISDK + 加密神经网络模型，依赖外接 RGB-IR 摄像头与私有驱动。
+中文 UI 文案加密在 `.xme`/`.date` 中，但**英文配置键、说明文字与 C++ 符号是明文**，
+据此还原出三项功能的实现方法。完整证据与映射表见 [GLANCE_ANALYSIS.md](GLANCE_ANALYSIS.md)：
+
+- **身后**：`FEATURE_SHOULDER_SURFING_LEFT/RIGHT` 左右 ROI + 多用户检测 +
+  `Surfer IR/RGB Threshold` 分类器置信度阈值 → **不是背景差分**。
+- **坐姿**：`..._DEPTH_THRESHOLD_CM` 真实深度 + `..._TIME_TO_WARNING` 持续时间。
+- **离席**：`POI_USED_GAZE/HEAD/PRESENCE` + 注意力可用/不可用双延迟 +
+  渐变暗屏警告 + snooze + 三种锁屏动作。
+- 另有 `FEATURE_DIGITAL_WELLNESS_*`、`FEATURE_AUTO_MUTE_*`、`FEATURE_ADAPTIVE_DIM_*`。
+
+### 两个历史问题的定性
+
+1. **11-10「崩溃退出」**：资源采样日志显示全部 `abnormal=false`，`resources.rs` 无杀进程路径；
+   计划任务（svchost 父进程）启动的 v3 连续存活，而工具会话 `Start-Process` 启动的实例
+   13–33 秒内死亡。11-11 由计划任务启动的 PID 3032 从 15:07 起**稳定存活超过 1 小时**。
+   结论：高置信度为工具会话的子进程生命周期导致，非代码缺陷。
+2. **身后误报 130 秒**：旧代码 `evidence = (other_faces > 0 || blob) && !global_change`，
+   只要背景差分有运动块就计数，主人打字、耸肩被当成身后人影。已按 Glance 思路改为
+   **第二张脸为主证据**，见下。
+
+### v5 改动（提交 62516f2）
+
+| 功能 | 改动 | 模拟的 Glance 能力 |
+| --- | --- | --- |
+| 身后 | 第二张脸连续确认拍数 + 左右肩后 ROI + 尺寸过滤；无第二张脸一律不提示 | 多用户置信度 + LEFT/RIGHT ROI |
+| 坐姿 | `posture_warning_secs` 可配置持续时长、设置页显示当前距离倍率 | TIME_TO_WARNING / CURRENT_DISTANCE |
+| 离席 | `snooze` 暂缓（只重置计时不撤防）、`lock_enabled` 仅提示模式、渐强警告进度 | PRESENCE_SNOOZE / LOCK_ACTION / FADE_TO_PERCENT |
+| 新增 | Digital Wellness 连续用眼提醒（离席自动重置） | DW_STATISTICS / POSTURE_REMINDER |
+| 新增 | Auto Mute 离席静音默认麦克风、回来恢复；只恢复由本程序设置的静音 | FEATURE_AUTO_MUTE |
+
+配置向后兼容旧 `presence.txt`，新增项均有默认值。所有新增逻辑为纯计时 / 现有
+WinRT 人脸检测 / 项目已有的 Core Audio 端点封装，**未引入任何新依赖或模型**，
+exe 体积保持在约 19 MB。
+
+### 本机实测证据（v3 运行期）
+
+- 稳定性：PID 3032（计划任务于 15:07:17 启动）持续存活，`resources.log` 每 30 秒采样，
+  内存约 78 MB、线程 34–37、句柄约 979，全部 `abnormal=false`。
+- 离席锁屏：`presence.log` 出现 `[1794384020] lock attempt ok=true`，
+  证明摄像头 → 人脸丢失 → 计时 → `LockWorkStation()` 全链路在真机成功执行。
+- 身后检测：`behind_enabled=0` 期间无误报；修复版待 v5 安装后重新启用验证。
+
+### 待办
+
+1. v5 CI（run 42984513687）通过 → 下载产物 → 安装 → 重新启用 `behind_enabled=1`。
+2. 观察 30 分钟：确认无误报、进程稳定、三项功能可触发。
+3. 需要用户配合的实测：坐姿校准、离席 5 秒倒计时 / 60 秒锁屏 / 返回解除、
+   第二人从身后经过的 1/3/5 秒分级。
+4. Auto Mute 默认关闭，确认后再在设置页开启（会实际操作系统麦克风）。
