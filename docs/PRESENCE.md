@@ -314,3 +314,60 @@ exe 体积保持在约 19 MB。
 
 本地校验：`rustfmt` 语法解析通过；纯 std 桩 crate 的 `rustc --emit metadata`
 （含 `--cfg test`）类型/借用检查通过。单测与 release 构建由 CI 执行。
+
+## 十二、17:27 定调与 v6 上线（阶段收尾）
+
+### 用户决策
+
+> 「如果实现太困难，那么就按照你说的『转头远眺算休息』轻量化实现，
+> 体积尽量控制在 30MB 以下，核心功能实现即可，眼动追踪可以暂时不上，后续需要在上」
+
+即：三项在场保护 + Digital Wellness + Auto Mute 为核心，注意力判定用 HEAD 档近似，
+**真眼动追踪本阶段不上**。完整的可行性分层评估见
+[GLANCE_ANALYSIS.md](GLANCE_ANALYSIS.md) 第八节；代码与 v6 完全一致，无需返工。
+
+### v6 安装记录（17:30）
+
+| 项目 | 值 |
+| --- | --- |
+| 提交 | `c9ee6b2`，只推 `origin/presence-v2`，upstream push 地址仍为 `DISABLE-DO-NOT-PUSH-UPSTREAM` |
+| 构建 workflow | run `42992688888` **success**：逻辑测试 / release 构建 / 上传产物全通过 |
+| `Windows 检查` | run `42992688831`：`installer` job success；`test` job 中「测试」「检查安装脚本语法」success，「验证发布构建与打包」为耗时的完整打包步骤（约 14 分钟） |
+| 产物 | `dist/daozai-presence-v6.zip` 9,501,348 B → `dist/v6-extract/daozai.exe` |
+| 安装文件 | **19,063,296 B（19.06 MB）**，SHA256 `dc254e5c3031e3b73f82bb7f93339d612bb4c248b585a68c62c7c4d505ab1fda` |
+| 回滚点 | `dist/daozai-v5-installed-backup-20261111.exe`（19,062,784 B，`c6117622…`） |
+| 启动 | 计划任务 `DaozaiDevTest`，**PID 10980**，父进程 2576（svchost），17:30:15 |
+| 摄像头链路 | `presence watcher stopped`（v5 优雅退出）→ `camera devices: Integrated Camera (non-IR preferred)` → `FaceDetector ready (MTA)` → `camera opened: Integrated Camera`，无帧错误 |
+| 资源采样 | `pid=10980` 两次采样均 `abnormal=false`；启动期内存 33→58 MB、线程 28→38 |
+| 体积结论 | 单文件 19.06 MB，**远低于 30 MB 上限**，为零新依赖 / 零模型 |
+
+### 配置处理（保留用户全部自定义值）
+
+安装前用户在设置页自行调整过参数，本次**仅追加一行** `wellness_poi=1`，其余原样保留：
+
+```
+lock_after_secs=25   lock_enabled=1   countdown_after_secs=5
+posture_baseline_w=0.1625   posture_baseline_h=0.3125   posture_calibrated=1
+behind_enabled=1   behind_motion=20   behind_min_cells=6   behind_face_confirm=2
+wellness_enabled=1   wellness_break_secs=1200   wellness_rest_secs=5
+auto_mute_enabled=1   wellness_poi=1
+```
+
+### 此前挂账的实测项，已由运行日志闭环
+
+- **Auto Mute 真机验证通过**：`presence.log` 中 `auto mute: mic muted while away`
+  与 `auto mute: mic restored on return` 成对出现十余次，含 v6 新进程（PID 10980）
+  重启后的三组，证明离席静音 / 返回恢复在真机完整工作；停止前最后一次为
+  `restored on return`，重启未遗留静音状态。用户已自行开启 `auto_mute_enabled=1`。
+- **离席锁屏真机多次通过**：除第十节的 `[1794385636]` 外，又新增
+  `[1794387131]`、`[1794389314]` 等 `lock attempt ok=true`。
+- **身后检测**：17:00 已双向验收（无误报、有正报），方案定稿，本阶段不再改动。
+
+### 剩余待办（均需用户在场，非阻塞）
+
+1. Digital Wellness 的 HEAD 档目视确认：转头远眺时设置页是否显示「视线离开」，
+   连续 `wellness_rest_secs`（当前 5 秒）后是否重置连续用眼计时；
+   以及 20 分钟用眼提醒是否出现。代码单测已覆盖。
+2. `Windows 检查` 的「验证发布构建与打包」最终结论（不影响已通过的核心构建与单测）。
+3. 每周上游同步的 WorkBuddy 定时任务仍为 PAUSED，待用户确认后恢复自动调度。
+4. 真 `POI_USED_GAZE` 按用户决定**暂缓**，作为后续可选升级项保留评估入口。
