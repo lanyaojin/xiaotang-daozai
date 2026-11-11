@@ -214,3 +214,57 @@ exe 体积保持在约 19 MB。
 3. 需要用户配合的实测：坐姿校准、离席 5 秒倒计时 / 60 秒锁屏 / 返回解除、
    第二人从身后经过的 1/3/5 秒分级。
 4. Auto Mute 默认关闭，确认后再在设置页开启（会实际操作系统麦克风）。
+
+## 十、2026-11-11 16:24–16:37 无人值守自动验证
+
+用户离开电脑期间自主执行，未改动运行中的程序。
+
+### 上线与环境
+
+| 项目 | 值 |
+| --- | --- |
+| 安装文件 | `dist/v5-extract/daozai.exe`，19,062,784 B，SHA256 `c6117622…9f26f9` |
+| 回滚点 | `dist/daozai-v3-installed-backup-20261111.exe`（19,055,616 B，`e9202f71…`） |
+| 启动方式 | 计划任务 `DaozaiDevTest`（svchost 父进程），PID 9820，16:24:11 启动 |
+| 摄像头链路 | `camera devices: Integrated Camera (non-IR preferred)` → `FaceDetector ready (MTA)` → `camera opened: Integrated Camera`，无帧错误、无重开 |
+| 配置 | 保留用户已校准的 `posture_calibrated=1`、基线 `0.16875/0.3`、`lock_after_secs=25`；`behind_enabled=1`、`wellness_enabled=1`、`auto_mute_enabled=0` |
+
+### 自动测试结果
+
+| 检查项 | 结果 |
+| --- | --- |
+| CI run `42984513687` | **success**（逻辑测试 / release 构建 / 上传产物全通过） |
+| `Windows 检查` run `42984513732` | **success** |
+| 12 分钟进程存活 | **通过**：16:25:48–16:36:49 共 12 个采样点，PID 9820 全程存活，线程 33–37 |
+| 资源稳定性 | **通过**：`resources.log` 中 pid=9820 共 26 次采样，`abnormal=false` 26 次、`abnormal=true` 0 次；内存约 78–83 MB、句柄 975 |
+| 离席自动锁屏 | **通过（真实场景）**：用户离开后 `[1794385636] lock attempt ok=true`，v5 上 25 秒阈值全链路成功；此前 v3 也有一次 `[1794384020] lock attempt ok=true` |
+| 上游同步审计 | `git fetch upstream` 后 `upstream/main = f046d6c`，`HEAD..upstream/main` 为 **0 个新提交**，无功能重叠；自研三项功能保留 |
+
+### panic 风险点静态复核（历史待办第 3 条）
+
+`release` profile 为 `panic = "abort"`，任意线程 panic 会静默终止进程，因此复核了在场保护路径：
+
+- `presence_backend.rs::detect()`：所有 WinRT 调用（`DataWriter::new` / `WriteBytes` /
+  `DetachBuffer` / `CreateCopyFromBuffer` / `DetectFacesAsync().get()` / `Size()` / `GetAt()` /
+  `FaceBox()`）均以 `Result` 早退，无 `unwrap`；`frame.usable()` 与 `fw/fh <= 0` 守卫在先，
+  输出坐标统一 `clamp(0,1)`。
+- `GrayFrame::cells()`：`gy`/`gx` 用 `.min(GRID_H-1)` / `.min(GRID_W-1)` 保证索引有界，
+  `counts[i]==0` 时返回 0.0，无除零。
+- `Watcher::motion()`：`background` 为 `None` 时先补齐再 `unwrap`；`global` 判定有
+  `counted > 0` 守卫。
+- `Watcher::tick()`：两处 `frame.as_ref().unwrap()` 均在 `!paused`（含 `has_frame`）分支内。
+- `PresenceUi::banner()` 的 `unreachable!()` 被 `s.behind != Level::None` 静态守卫。
+
+结论：**在场保护路径无未防护的 panic 源**；配合 v3 连续 1 小时 + v5 连续 12 分钟真机存活，
+11-10 的「静默退出」可结案为启动方式问题，不再是待办阻塞项。
+
+### 仍需用户回来后确认（无人时无法覆盖）
+
+1. 身后误报是否根除：需主人在座时观察屏幕，确认打字/耸肩不再出现「身后有人」提示。
+   代码级回归单测 `motion_alone_never_triggers_behind` 已覆盖，但真机需目视确认。
+2. 第二人从身后经过的 1/3/5 秒白黄红分级与点击消除。
+3. 坐姿太近提示（用户已校准基线，可复核触发与解除）。
+4. Digital Wellness 20 分钟用眼提醒、Auto Mute 真机麦克风静音/恢复（后者默认关闭）。
+
+> 每周同步的 WorkBuddy 定时任务目前仍为 PAUSED；本次以手动审计代替，
+> 待用户确认后再恢复自动调度。所有提交只推送 `origin/presence-v2`，未推上游。
