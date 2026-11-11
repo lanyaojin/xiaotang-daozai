@@ -623,10 +623,17 @@ impl Watcher {
                 diffs[i] = d;
                 let cx = (gx as f32 + 0.5) / GRID_W as f32;
                 let cy = (gy as f32 + 0.5) / GRID_H as f32;
+                // 主人排除区：1) 人脸框附近；2) 脸框下方的「身体锥形」——从脸往下延伸到
+                // 画面底部、左右放宽到肩/手范围。单 RGB 摄像头无法真正区分「身后」，
+                // 若不排除主人自己的躯干与手部动作，打字、耸肩会被误判成身后人影
+                // （2026-11-11 本机实测误报 130 秒红字）。
                 let in_owner = owner.is_some_and(|b| {
                     let pad = 0.12;
-                    cx >= b.x - pad && cx <= b.x + b.w + pad
-                        && cy >= b.y - pad && cy <= b.y + b.h + pad
+                    let body_pad = (b.w * 0.8).max(0.08);
+                    (cx >= b.x - pad && cx <= b.x + b.w + pad
+                        && cy >= b.y - pad && cy <= b.y + b.h + pad)
+                        || (cy >= b.y + b.h * 0.5
+                            && cx >= b.x - body_pad && cx <= b.x + b.w + body_pad)
                 });
                 if !in_owner {
                     counted += 1;
@@ -993,6 +1000,21 @@ mod tests {
             s = step(&mut w, &mut d, t0, 0.5 * i as f64, Some(GrayFrame::blank(FRAME_W, FRAME_H, 220)), &c).0;
         }
         assert_eq!(s.behind, Level::None, "整屏变亮是光照变化，不是人影");
+    }
+
+    #[test]
+    fn owner_body_motion_below_face_is_not_behind_evidence() {
+        // 主人脸框正下方（躯干/手）持续晃动 12 秒：打字、耸肩不得被当成身后人影。
+        // 2026-11-11 本机实测：旧版只排除脸框附近，误报红字 130 秒。
+        let t0 = Instant::now();
+        let mut w = Watcher::new(Config::default());
+        let mut d = FakeDetector::new(vec![vec![owner()]]);
+        let c = ctrl();
+        step(&mut w, &mut d, t0, 0.0, Some(bright()), &c);
+        let body = || Some(bright().with_block(90, 130, 100, 100, 210));
+        let mut s = Snapshot::default();
+        for i in 1..=24 { s = step(&mut w, &mut d, t0, 0.5 * i as f64, body(), &c).0; }
+        assert_eq!(s.behind, Level::None, "主人自己的身体动作不算身后人影");
     }
 
     #[test]
