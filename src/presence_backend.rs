@@ -391,3 +391,52 @@ impl crate::presence::FaceDetector for DetectorImpl {
 pub fn lock_workstation() -> bool { false }
 #[cfg(not(windows))]
 pub fn log(_message: &str) {}
+
+// ---------------------------------------------------------------------------
+// Auto Mute：默认麦克风端点静音（模拟 Glance FEATURE_AUTO_MUTE_*）
+//
+// 复用 system.rs 的 IMMDeviceEnumerator 模式，但取 eCapture 而非 eRender。
+// 关键：调用方是已初始化 COM(MTA) 的 presence 采集线程，这里绝不能再调
+// CoInitializeEx(STA)——那正是 2026-11-10 摄像头打不开的根因。
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+mod mic {
+    use std::cell::RefCell;
+    use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
+    use windows::Win32::Media::Audio::{eCapture, eConsole, IMMDeviceEnumerator, MMDeviceEnumerator};
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
+
+    fn endpoint() -> Option<IAudioEndpointVolume> {
+        thread_local! {
+            static ENUM: RefCell<Option<IMMDeviceEnumerator>> = const { RefCell::new(None) };
+        }
+        unsafe {
+            ENUM.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?);
+                }
+                let dev = slot.as_ref()?.GetDefaultAudioEndpoint(eCapture, eConsole).ok()?;
+                dev.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None).ok()
+            })
+        }
+    }
+
+    pub fn muted() -> Option<bool> {
+        unsafe { Some(endpoint()?.GetMute().ok()?.as_bool()) }
+    }
+
+    pub fn set(mute: bool) -> bool {
+        unsafe { endpoint().is_some_and(|a| a.SetMute(mute, std::ptr::null()).is_ok()) }
+    }
+}
+
+#[cfg(windows)]
+pub fn mic_muted() -> Option<bool> { mic::muted() }
+#[cfg(windows)]
+pub fn set_mic_mute(mute: bool) -> bool { mic::set(mute) }
+#[cfg(not(windows))]
+pub fn mic_muted() -> Option<bool> { None }
+#[cfg(not(windows))]
+pub fn set_mic_mute(_mute: bool) -> bool { false }

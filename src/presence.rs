@@ -8,8 +8,12 @@
 //! 4. 后台线程用显式 COM(MTA) 初始化，WinRT 人脸检测不占用 UI 线程。
 //! 5. 线程停止用显式 stop 标志，每拍无条件检查；不依赖 channel 断连。
 //! 6. 所有开关与阈值持久化；错误状态可见、可排查。
-//! 7. 身后身影采用「主座位区域以外的持续运动块 + 非主人人脸」双证据，
-//!    并按 1/3/5 秒分级；提示可点击消除，直到本次事件结束不再打扰。
+//! 7. 身后身影以「非主人的第二张人脸」为主证据（2026-11-11 误报事故后修正），
+//!    左右肩后 ROI 的运动块只作辅助；按 1/3/5 秒分级，提示可点击消除。
+//! 8. 行为逻辑参考 Glance 11.19 的明文配置项模拟（见 docs/GLANCE_ANALYSIS.md），
+//!    但不用 IR 深度摄像头 / 神经网络模型：坐姿用脸框比例代替厘米深度，
+//!    离席用渐强警告 + snooze 代替注视追踪，Digital Wellness / Auto Mute
+//!    复用同一套在场信号，保持单文件、零额外依赖、exe 约 19MB。
 //!
 //! 本模块不依赖 egui / Windows API，纯逻辑可用假帧与假检测器单测。
 
@@ -33,8 +37,8 @@ pub const BEHIND_YELLOW: f64 = 3.0;
 pub const BEHIND_RED: f64 = 5.0;
 /// 身影证据短暂消失的宽限，避免因压缩噪声/自动曝光把 5 秒计时清零。
 pub const BEHIND_GRACE: f64 = 0.6;
-/// 坐姿进入/解除的持续时间（秒），防止低头抬头引起闪烁。
-pub const POSTURE_ENTER: f64 = 2.0;
+/// 坐姿解除的持续时间（秒）；进入时长已改为可配置的
+/// `Config::posture_warning_secs`（模拟 Glance TIME_TO_WARNING）。
 pub const POSTURE_CLEAR: f64 = 2.0;
 /// 人脸短暂漏检的容忍拍数（250ms/拍）。
 pub const OWNER_DROP_TICKS: u32 = 3;
@@ -51,6 +55,8 @@ pub struct Config {
     pub lock_after_secs: f64,
     /// 离席多久开始显示倒计时，默认 5 秒。
     pub countdown_after_secs: f64,
+    /// 到点是否真正锁屏；false = 只提示不锁（模拟 Glance LOCK_ACTION_* 的轻量版）。
+    pub lock_enabled: bool,
     pub posture_enabled: bool,
     /// 脸框超过基线多少倍判定太近，默认 1.30。
     pub posture_ratio: f32,
@@ -58,11 +64,23 @@ pub struct Config {
     pub posture_baseline_w: f32,
     pub posture_baseline_h: f32,
     pub posture_calibrated: bool,
+    /// 太近需持续多久才提示（模拟 Glance FEATURE_POSTURE_REMINDER_TIME_TO_WARNING）。
+    pub posture_warning_secs: f64,
     pub behind_enabled: bool,
     /// 背景差分显著变化的灰阶阈值（越大越不敏感）。
     pub behind_motion: f32,
     /// 判定身影所需的最小变化网格数。
     pub behind_min_cells: usize,
+    /// 「第二张脸」需连续确认的拍数（模拟 Glance Surfer IR/RGB Threshold）。
+    pub behind_face_confirm: u32,
+    /// Digital Wellness：连续用眼提醒开关。
+    pub wellness_enabled: bool,
+    /// 连续在座多久提醒远眺，默认 20 分钟。
+    pub wellness_break_secs: f64,
+    /// 离席多久算完成一次休息，默认 20 秒。
+    pub wellness_rest_secs: f64,
+    /// Auto Mute：离席自动静音麦克风，回来自动恢复。
+    pub auto_mute_enabled: bool,
 }
 
 impl Default for Config {
@@ -71,14 +89,21 @@ impl Default for Config {
             enabled: false,
             lock_after_secs: 30.0,
             countdown_after_secs: 5.0,
+            lock_enabled: true,
             posture_enabled: true,
             posture_ratio: 1.30,
             posture_baseline_w: 0.16,
             posture_baseline_h: 0.32,
             posture_calibrated: false,
+            posture_warning_secs: 2.0,
             behind_enabled: true,
             behind_motion: 18.0,
             behind_min_cells: 6,
+            behind_face_confirm: 2,
+            wellness_enabled: false,
+            wellness_break_secs: 1200.0,
+            wellness_rest_secs: 20.0,
+            auto_mute_enabled: false,
         }
     }
 }
@@ -90,8 +115,12 @@ impl Config {
         self.posture_ratio = self.posture_ratio.clamp(1.05, 2.0);
         self.posture_baseline_w = self.posture_baseline_w.clamp(0.04, 0.70);
         self.posture_baseline_h = self.posture_baseline_h.clamp(0.08, 0.95);
+        self.posture_warning_secs = self.posture_warning_secs.clamp(0.5, 30.0);
         self.behind_motion = self.behind_motion.clamp(6.0, 60.0);
         self.behind_min_cells = self.behind_min_cells.clamp(2, 60);
+        self.behind_face_confirm = self.behind_face_confirm.clamp(1, 12);
+        self.wellness_break_secs = self.wellness_break_secs.clamp(60.0, 7200.0);
+        self.wellness_rest_secs = self.wellness_rest_secs.clamp(5.0, 300.0);
     }
 
     fn path() -> PathBuf {
@@ -109,7 +138,14 @@ impl Config {
                 "enabled" => c.enabled = v == "1",
                 "lock_after_secs" => c.lock_after_secs = v.parse().unwrap_or(c.lock_after_secs),
                 "countdown_after_secs" => c.countdown_after_secs = v.parse().unwrap_or(c.countdown_after_secs),
+                "lock_enabled" => c.lock_enabled = v == "1",
                 "posture_enabled" => c.posture_enabled = v == "1",
+                "posture_warning_secs" => c.posture_warning_secs = v.parse().unwrap_or(c.posture_warning_secs),
+                "behind_face_confirm" => c.behind_face_confirm = v.parse().unwrap_or(c.behind_face_confirm),
+                "wellness_enabled" => c.wellness_enabled = v == "1",
+                "wellness_break_secs" => c.wellness_break_secs = v.parse().unwrap_or(c.wellness_break_secs),
+                "wellness_rest_secs" => c.wellness_rest_secs = v.parse().unwrap_or(c.wellness_rest_secs),
+                "auto_mute_enabled" => c.auto_mute_enabled = v == "1",
                 "posture_ratio" => c.posture_ratio = v.parse().unwrap_or(c.posture_ratio),
                 "posture_baseline_w" => c.posture_baseline_w = v.parse().unwrap_or(c.posture_baseline_w),
                 "posture_baseline_h" => c.posture_baseline_h = v.parse().unwrap_or(c.posture_baseline_h),
@@ -131,18 +167,25 @@ impl Config {
             c
         };
         let text = format!(
-            "enabled={}\nlock_after_secs={}\ncountdown_after_secs={}\nposture_enabled={}\nposture_ratio={}\nposture_baseline_w={}\nposture_baseline_h={}\nposture_calibrated={}\nbehind_enabled={}\nbehind_motion={}\nbehind_min_cells={}\n",
+            "enabled={}\nlock_after_secs={}\ncountdown_after_secs={}\nlock_enabled={}\nposture_enabled={}\nposture_ratio={}\nposture_baseline_w={}\nposture_baseline_h={}\nposture_calibrated={}\nposture_warning_secs={}\nbehind_enabled={}\nbehind_motion={}\nbehind_min_cells={}\nbehind_face_confirm={}\nwellness_enabled={}\nwellness_break_secs={}\nwellness_rest_secs={}\nauto_mute_enabled={}\n",
             c.enabled as u8,
             c.lock_after_secs,
             c.countdown_after_secs,
+            c.lock_enabled as u8,
             c.posture_enabled as u8,
             c.posture_ratio,
             c.posture_baseline_w,
             c.posture_baseline_h,
             c.posture_calibrated as u8,
+            c.posture_warning_secs,
             c.behind_enabled as u8,
             c.behind_motion,
             c.behind_min_cells,
+            c.behind_face_confirm,
+            c.wellness_enabled as u8,
+            c.wellness_break_secs,
+            c.wellness_rest_secs,
+            c.auto_mute_enabled as u8,
         );
         let path = Self::path();
         if let Some(dir) = path.parent() {
@@ -282,7 +325,7 @@ pub enum Level {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Kind { Away, Posture, Behind, Diag }
+pub enum Kind { Away, Posture, Behind, Diag, Wellness }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tone { White, Yellow, Red }
@@ -315,6 +358,16 @@ pub struct Snapshot {
     pub behind_secs: f64,
     pub behind_epoch: u64,
     pub other_faces: usize,
+    /// 当前脸框相对校准基线的倍率（模拟 Glance CURRENT_DISTANCE 显示）。
+    pub posture_closeness: f32,
+    /// 离席警告渐强进度 0..1（模拟 Glance FADE_TO_PERCENT / ADAPTIVE_DIM）。
+    pub dim_progress: f32,
+    /// 连续用眼时长（秒）。
+    pub wellness_secs: f64,
+    pub wellness_due: bool,
+    pub wellness_epoch: u64,
+    /// 当前应处于「保护性静音」状态（模拟 Glance AUTO_MUTE）。
+    pub mic_mute: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -330,6 +383,8 @@ pub struct Banner {
 pub struct Control {
     pub config: Config,
     pub dismissed: HashMap<Kind, u64>,
+    /// UI 点「暂缓锁屏」时自增；Watcher 看到 epoch 变化就重置离席计时。
+    pub snooze_epoch: u64,
 }
 
 impl Control {
@@ -358,10 +413,17 @@ pub struct Watcher {
     posture_active: bool,
     posture_epoch: u64,
     background: Option<Vec<f32>>,
+    /// 连续看到「非主人侧脸」的拍数：低拍数视为低置信度，不单独触发提示。
+    face_streak: u32,
     behind_accum: f64,
     behind_missing: f64,
     behind_active: bool,
     behind_epoch: u64,
+    last_snooze_epoch: u64,
+    wellness_accum: f64,
+    wellness_rest: f64,
+    wellness_due: bool,
+    wellness_epoch: u64,
     diag_epoch: u64,
     last_diag: String,
     seq: u64,
@@ -386,10 +448,16 @@ impl Watcher {
             posture_active: false,
             posture_epoch: 0,
             background: None,
+            face_streak: 0,
             behind_accum: 0.0,
             behind_missing: 0.0,
             behind_active: false,
             behind_epoch: 0,
+            last_snooze_epoch: 0,
+            wellness_accum: 0.0,
+            wellness_rest: 0.0,
+            wellness_due: false,
+            wellness_epoch: 0,
             diag_epoch: 0,
             last_diag: String::new(),
             seq: 0,
@@ -435,6 +503,12 @@ impl Watcher {
             (others, b)
         };
 
+        // ---- 暂缓锁屏：模拟 Glance FEATURE_PRESENCE_SNOOZE_VALUE ----
+        if ctrl.snooze_epoch != self.last_snooze_epoch {
+            self.last_snooze_epoch = ctrl.snooze_epoch;
+            if self.away_active { self.away_accum = 0.0; }
+        }
+
         // ---- 离席与锁屏 ----
         if !paused {
             if self.owner_present {
@@ -456,18 +530,33 @@ impl Watcher {
             && !self.owner_present
             && !paused
             && !self.locked
+            && self.config.lock_enabled
             && self.away_accum >= self.config.lock_after_secs;
         let countdown = self.owner_ever
             && !self.owner_present
             && !paused
             && !self.locked
             && self.away_accum >= self.config.countdown_after_secs;
+        // 渐强警告进度：模拟 Glance FADE_TO_PERCENT / FEATURE_ADAPTIVE_DIM_*。
+        // 单 RGB 轻量版不改显示器亮度，只让横幅由白渐黄并给出 0..1 进度。
+        let dim_progress = if countdown {
+            let span = (self.config.lock_after_secs - self.config.countdown_after_secs).max(1.0);
+            ((self.away_accum - self.config.countdown_after_secs) / span).clamp(0.0, 1.0) as f32
+        } else { 0.0 };
+        // ---- Auto Mute：离席后要求保护性静音，回来恢复（模拟 FEATURE_AUTO_MUTE_*）----
+        let mic_mute = self.config.auto_mute_enabled
+            && self.owner_ever
+            && !self.owner_present
+            && !paused;
 
-        // ---- 坐姿 ----
+        // ---- 坐姿：模拟 FEATURE_POSTURE_REMINDER_TIME_TO_WARNING + CURRENT_DISTANCE ----
         let bw = self.config.posture_baseline_w;
         let bh = self.config.posture_baseline_h;
         let ratio = self.config.posture_ratio;
         let clear_ratio = (ratio - 0.15).max(1.02);
+        let posture_closeness = owner_box
+            .map(|b| (b.w / bw.max(1e-6)).max(b.h / bh.max(1e-6)))
+            .unwrap_or(0.0);
         let too_close_now = self.config.posture_enabled
             && self.owner_present
             && owner_box.is_some_and(|b| b.w > bw * ratio || b.h > bh * ratio);
@@ -483,7 +572,7 @@ impl Watcher {
                     self.posture_clear += dt;
                 }
             }
-            if !self.posture_active && self.posture_accum >= POSTURE_ENTER {
+            if !self.posture_active && self.posture_accum >= self.config.posture_warning_secs {
                 self.posture_active = true;
                 self.posture_epoch += 1;
             } else if self.posture_active && clear_now && self.posture_clear >= POSTURE_CLEAR {
@@ -493,22 +582,75 @@ impl Watcher {
             }
         }
 
-        // ---- 身后身影 ----
-        let mut evidence = false;
-        if self.config.behind_enabled && self.owner_present && !paused {
-            let cells = frame.as_ref().unwrap().cells();
-            let (blob, global_change) = self.motion(&cells, owner_box);
-            evidence = (other_faces > 0 || blob) && !global_change;
+        // ---- Digital Wellness：连续用眼统计与远眺提醒 ----
+        if self.wellness_due && ctrl.hidden(Kind::Wellness, self.wellness_epoch) {
+            self.wellness_due = false;
+            self.wellness_accum = 0.0;
         }
         if !paused {
-            if evidence {
+            if self.owner_present {
+                self.wellness_accum += dt;
+                self.wellness_rest = 0.0;
+            } else if self.owner_ever {
+                self.wellness_rest += dt;
+                if self.wellness_rest >= self.config.wellness_rest_secs {
+                    self.wellness_accum = 0.0;
+                    self.wellness_rest = 0.0;
+                    self.wellness_due = false;
+                }
+            }
+            if self.config.wellness_enabled
+                && !self.wellness_due
+                && self.wellness_accum >= self.config.wellness_break_secs
+            {
+                self.wellness_due = true;
+                self.wellness_epoch += 1;
+            }
+        }
+
+        // ---- 身后身影：模拟 Glance FEATURE_SHOULDER_SURFING_LEFT/RIGHT ----
+        // Glance 用多用户人脸检测 + IR/RGB 分类器置信度阈值；我们没有 IR 与模型，
+        // 因此把「第二张脸连续出现的拍数」当作置信度，左右肩后 ROI 的运动块只作辅助。
+        // 2026-11-11 事故根因：旧版 `evidence = other_faces > 0 || blob`，
+        // 打字/耸肩的运动块单独就把提示刷到红字 130 秒。现在没有第二张脸一律不计数。
+        let mut evidence_gain = 0.0;
+        if self.config.behind_enabled && self.owner_present && !paused {
+            let cells = frame.as_ref().unwrap().cells();
+            let (side_blob, global_change) = self.motion(&cells, owner_box);
+            let side_faces = faces.iter().filter(|f| {
+                if owner_box.is_some_and(|o| o.matches(f)) { return false; }
+                let (cx, cy) = f.center();
+                owner_box.is_some_and(|o| {
+                    cy >= o.y - 0.10 && cy <= o.y + o.h * 1.5
+                        && (cx < o.x - o.w * 0.10 || cx > o.x + o.w * 1.10)
+                        // 尺寸相近才算「站在身后的人」，排除远景小脸/海报。
+                        && f.w >= o.w * 0.30 && f.w <= o.w * 3.0
+                })
+            }).count();
+            // 单帧误检不算人；置信度记忆上限很低，漏检时快速衰减，
+            // 避免一次误检把提示长期钉在屏幕上。
+            let streak_cap = self.config.behind_face_confirm.saturating_mul(2).max(4);
+            self.face_streak = if side_faces > 0 {
+                (self.face_streak + 1).min(streak_cap)
+            } else {
+                self.face_streak.saturating_sub(2)
+            };
+            let strong = self.face_streak >= self.config.behind_face_confirm;
+            if self.face_streak > 0 && (strong || (side_blob && !global_change)) {
+                evidence_gain = dt;
+            }
+        } else {
+            self.face_streak = 0;
+        }
+        if !paused {
+            if evidence_gain > 0.0 {
                 self.behind_missing = 0.0;
                 if !self.behind_active {
                     self.behind_active = true;
                     self.behind_epoch += 1;
                     self.behind_accum = 0.0;
                 }
-                self.behind_accum += dt;
+                self.behind_accum += evidence_gain;
             } else if self.behind_active {
                 self.behind_missing += dt;
                 if self.behind_missing >= BEHIND_GRACE {
@@ -565,12 +707,19 @@ impl Watcher {
             behind_secs: self.behind_accum,
             behind_epoch: self.behind_epoch,
             other_faces,
+            posture_closeness,
+            dim_progress,
+            wellness_secs: self.wellness_accum,
+            wellness_due: self.wellness_due,
+            wellness_epoch: self.wellness_epoch,
+            mic_mute,
         };
         // 点击消除：按事件 epoch 抑制，事件结束后自动恢复。
         if ctrl.hidden(Kind::Diag, snap.diag_epoch) { snap.diag.clear(); }
         if ctrl.hidden(Kind::Away, snap.away_epoch) { snap.countdown = false; }
         if ctrl.hidden(Kind::Posture, snap.posture_epoch) { snap.posture = false; }
         if ctrl.hidden(Kind::Behind, snap.behind_epoch) { snap.behind = Level::None; }
+        if ctrl.hidden(Kind::Wellness, snap.wellness_epoch) { snap.wellness_due = false; }
         (snap, lock_now)
     }
 
@@ -604,7 +753,7 @@ impl Watcher {
         (true, Some(b), faces.len().saturating_sub(1))
     }
 
-    /// 背景差分：返回 (局部显著变化, 全局光照突变)。
+    /// 左右肩后 ROI 背景差分：返回 (侧翼显著变化, 全局光照突变)。
     fn motion(&mut self, cells: &[f32], owner: Option<FaceBox>) -> (bool, bool) {
         if cells.len() != GRID_CELLS { return (false, false); }
         if self.background.is_none() {
@@ -635,7 +784,16 @@ impl Watcher {
                         || (cy >= b.y + b.h * 0.5
                             && cx >= b.x - body_pad && cx <= b.x + b.w + body_pad)
                 });
-                if !in_owner {
+                // 模拟 FEATURE_SHOULDER_SURFING_LEFT/RIGHT：只统计主人左右两侧、
+                // 与头部高度相当的「肩后带」，忽略头顶/脚下/画面边缘的光影变化。
+                let in_side = owner.is_some_and(|b| {
+                    let top = (b.y - 0.08).max(0.0);
+                    let bottom = (b.y + b.h * 1.5).min(0.95);
+                    cy >= top && cy <= bottom
+                        && ((cx > 0.02 && cx < b.x - b.w * 0.10)
+                            || (cx > b.x + b.w * 1.10 && cx < 0.98))
+                });
+                if in_side && !in_owner {
                     counted += 1;
                     if d > threshold { changed += 1; }
                 }
@@ -669,7 +827,9 @@ pub struct Service {
 impl Service {
     pub fn start(config: Config) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        let control = Arc::new(Mutex::new(Control { config, dismissed: HashMap::new() }));
+        let control = Arc::new(Mutex::new(Control {
+            config, dismissed: HashMap::new(), snooze_epoch: 0,
+        }));
         let shared = Arc::new(Mutex::new(None));
         let handle = std::thread::Builder::new()
             .name("daozai-presence".into())
@@ -697,6 +857,13 @@ impl Service {
         if let Ok(mut c) = self.control.lock() { c.dismissed.insert(kind, epoch); }
     }
 
+    /// UI 点「暂缓锁屏」：只重置离席计时，布防状态不变。
+    pub fn snooze(&self) {
+        if let Ok(mut c) = self.control.lock() {
+            c.snooze_epoch = c.snooze_epoch.wrapping_add(1);
+        }
+    }
+
     pub fn poll(&self) -> Option<Snapshot> {
         self.shared.lock().ok().and_then(|s| s.clone())
     }
@@ -715,6 +882,8 @@ fn run(stop: Arc<AtomicBool>, control: Arc<Mutex<Control>>, shared: Arc<Mutex<Op
     let initial = control.lock().map(|c| c.config.clone()).unwrap_or_default();
     let mut watcher = Watcher::new(initial);
     let mut last_lock_attempt: Option<Instant> = None;
+    // Auto Mute：只记录「由我们静音」的状态，绝不覆盖用户原本的静音设置。
+    let mut we_muted_mic = false;
 
     loop {
         if stop.load(Ordering::Relaxed) { break; }
@@ -723,6 +892,21 @@ fn run(stop: Arc<AtomicBool>, control: Arc<Mutex<Control>>, shared: Arc<Mutex<Op
         let status = source.status();
         let ctrl = control.lock().map(|c| c.clone()).unwrap_or_default();
         let (snap, lock_now) = watcher.tick(frame, started, &mut detector, &status, &ctrl);
+        // Auto Mute：离席时静音麦克风（仅当用户本来没静音），回来时恢复。
+        // 调用发生在已初始化 COM(MTA) 的采集线程，后端不再做任何 COM 初始化。
+        if snap.mic_mute && !we_muted_mic {
+            if matches!(crate::presence_backend::mic_muted(), Some(false))
+                && crate::presence_backend::set_mic_mute(true)
+            {
+                we_muted_mic = true;
+                crate::presence_backend::log("auto mute: mic muted while away");
+            }
+        } else if !snap.mic_mute && we_muted_mic {
+            if crate::presence_backend::set_mic_mute(false) {
+                we_muted_mic = false;
+                crate::presence_backend::log("auto mute: mic restored on return");
+            }
+        }
         if lock_now && last_lock_attempt.map_or(true, |t| started.duration_since(t) >= Duration::from_secs(2)) {
             last_lock_attempt = Some(started);
             let ok = crate::presence_backend::lock_workstation();
@@ -732,6 +916,8 @@ fn run(stop: Arc<AtomicBool>, control: Arc<Mutex<Control>>, shared: Arc<Mutex<Op
         if let Ok(mut slot) = shared.lock() { *slot = Some(snap); }
         std::thread::sleep(TICK.saturating_sub(started.elapsed()));
     }
+    // 退出前一定把麦克风恢复，避免服务停止后用户一直处于静音。
+    if we_muted_mic { let _ = crate::presence_backend::set_mic_mute(false); }
     crate::presence_backend::log("presence watcher stopped");
 }
 
@@ -798,9 +984,19 @@ impl PresenceUi {
                 text: "离屏幕太近了，坐远一点".into(), hint: "点击消除".into(),
             });
         }
-        if s.countdown {
+        if s.wellness_due {
             return Some(Banner {
-                kind: Kind::Away, epoch: s.away_epoch, tone: Tone::White,
+                kind: Kind::Wellness, epoch: s.wellness_epoch, tone: Tone::White,
+                text: format!("已连续用眼 {:.0} 分钟，抬头远眺一会儿",
+                    (s.wellness_secs / 60.0).floor()),
+                hint: "点击消除".into(),
+            });
+        }
+        if s.countdown {
+            // 渐强警告：模拟 Glance FADE_TO_PERCENT，越接近锁屏由白转黄。
+            let tone = if s.dim_progress > 0.6 { Tone::Yellow } else { Tone::White };
+            return Some(Banner {
+                kind: Kind::Away, epoch: s.away_epoch, tone,
                 text: format!("离开中，还剩 {} 秒锁屏", s.lock_remaining.ceil() as u64),
                 hint: "点击隐藏".into(),
             });
@@ -824,8 +1020,14 @@ impl PresenceUi {
                 Kind::Posture => s.posture = false,
                 Kind::Behind => s.behind = Level::None,
                 Kind::Diag => s.diag.clear(),
+                Kind::Wellness => s.wellness_due = false,
             }
         }
+    }
+
+    /// 倒计时期间「暂缓锁屏」（模拟 Glance FEATURE_PRESENCE_SNOOZE_VALUE）。
+    pub fn snooze(&mut self) {
+        if let Some(s) = &self.service { s.snooze(); }
     }
 
     pub fn set_enabled(&mut self, enabled: bool) {
@@ -896,8 +1098,13 @@ mod tests {
     }
 
     fn owner() -> FaceBox { FaceBox { x: 0.35, y: 0.25, w: 0.16, h: 0.32 } }
+    /// 站在主人右后方的第二个人（Glance 的多用户检测场景）。
+    fn stranger() -> FaceBox { FaceBox { x: 0.76, y: 0.10, w: 0.14, h: 0.28 } }
     fn ok_source() -> SourceStatus { SourceStatus { ok: true, name: "Integrated Camera".into() } }
-    fn ctrl() -> Control { Control { config: Config::default(), dismissed: HashMap::new() } }
+    fn ctrl_with(config: Config) -> Control {
+        Control { config, dismissed: HashMap::new(), snooze_epoch: 0 }
+    }
+    fn ctrl() -> Control { ctrl_with(Config::default()) }
     fn at(t0: Instant, s: f64) -> Instant { t0 + Duration::from_secs_f64(s) }
     fn bright() -> GrayFrame { GrayFrame::blank(FRAME_W, FRAME_H, 128) }
 
@@ -962,9 +1169,9 @@ mod tests {
     fn behind_levels_are_1_3_5_seconds_and_dismiss_is_per_event() {
         let t0 = Instant::now();
         let mut w = Watcher::new(Config::default());
-        let mut d = FakeDetector::new(vec![vec![owner()]]);
+        // 第一拍只有主人（建立背景），之后主人 + 右后方的第二张脸。
+        let mut d = FakeDetector::new(vec![vec![owner()], vec![owner(), stranger()]]);
         let mut c = ctrl();
-        // 第一帧建立背景（主人 + 干净背景）
         step(&mut w, &mut d, t0, 0.0, Some(bright()), &c);
         // 之后每 0.5 秒一帧：右上角出现一块人影（主座位区域之外）
         let blob = || Some(bright().with_block(250, 10, 60, 90, 210));
@@ -980,10 +1187,13 @@ mod tests {
         c.dismissed.insert(Kind::Behind, epoch);
         s = step(&mut w, &mut d, t0, 5.5, blob(), &c).0;
         assert_eq!(s.behind, Level::None, "点击后应立即消除");
-        // 身影消失 → 事件结束 → 再次出现时是新事件，恢复提示
-        for i in 12..=16 { s = step(&mut w, &mut d, t0, 0.5 * i as f64, Some(bright()), &c).0; }
+        // 身影与第二张脸一起消失 → 置信度衰减 → 事件结束。
+        let mut gone = FakeDetector::new(vec![vec![owner()]]);
+        for i in 12..=16 { s = step(&mut w, &mut gone, t0, 0.5 * i as f64, Some(bright()), &c).0; }
         assert_eq!(s.behind, Level::None);
-        for i in 17..=20 { s = step(&mut w, &mut d, t0, 0.5 * i as f64, blob(), &c).0; }
+        // 新事件：人影与第二张脸重新出现，恢复提示。
+        let mut again = FakeDetector::new(vec![vec![owner(), stranger()]]);
+        for i in 17..=20 { s = step(&mut w, &mut again, t0, 0.5 * i as f64, blob(), &c).0; }
         assert_ne!(s.behind_epoch, epoch, "新事件应换 epoch");
         assert_eq!(s.behind, Level::White, "新事件重新提示");
     }
@@ -1018,6 +1228,125 @@ mod tests {
     }
 
     #[test]
+    fn motion_alone_never_triggers_behind() {
+        // 2026-11-11 误报回归：主人在座、左右侧翼有持续运动块（打字/光影/宠物），
+        // 但画面里从来没有第二张脸 —— 20 秒内不得出现任何身后提示。
+        let t0 = Instant::now();
+        let mut w = Watcher::new(Config::default());
+        let mut d = FakeDetector::new(vec![vec![owner()]]);
+        let c = ctrl();
+        step(&mut w, &mut d, t0, 0.0, Some(bright()), &c);
+        let side = || Some(bright().with_block(260, 40, 55, 120, 215));
+        let mut s = Snapshot::default();
+        for i in 1..=40 { s = step(&mut w, &mut d, t0, 0.5 * i as f64, side(), &c).0; }
+        assert_eq!(s.behind, Level::None, "没有第二张脸，运动块再久也不算身后人影");
+        assert_eq!(s.behind_secs, 0.0);
+    }
+
+    #[test]
+    fn snooze_resets_away_timer_without_disarming() {
+        let t0 = Instant::now();
+        let mut w = Watcher::new(Config::default());
+        let mut d = FakeDetector::new(vec![vec![owner()], vec![]]);
+        let mut c = ctrl();
+        step(&mut w, &mut d, t0, 0.0, Some(bright()), &c);
+        let mut s = Snapshot::default();
+        for i in 1..=20 { s = step(&mut w, &mut d, t0, 0.5 * i as f64, Some(bright()), &c).0; }
+        assert!(s.countdown, "离席应进入倒计时");
+        c.snooze_epoch += 1;
+        s = step(&mut w, &mut d, t0, 10.5, Some(bright()), &c).0;
+        assert!(s.away_secs < 1.0, "暂缓应重置离席计时");
+        let mut locked = false;
+        for i in 22..=90 {
+            if step(&mut w, &mut d, t0, 0.5 * i as f64, Some(bright()), &c).1 {
+                locked = true;
+                break;
+            }
+        }
+        assert!(locked, "暂缓只是延后，布防仍然有效");
+    }
+
+    #[test]
+    fn lock_disabled_only_warns() {
+        let t0 = Instant::now();
+        let mut cfg = Config::default();
+        cfg.lock_enabled = false;
+        let mut w = Watcher::new(cfg.clone());
+        let mut d = FakeDetector::new(vec![vec![owner()], vec![]]);
+        let c = ctrl_with(cfg);
+        step(&mut w, &mut d, t0, 0.0, Some(bright()), &c);
+        let mut warned = false;
+        let mut locked = false;
+        for i in 1..=90 {
+            let (s, l) = step(&mut w, &mut d, t0, 0.5 * i as f64, Some(bright()), &c);
+            warned |= s.countdown;
+            locked |= l;
+        }
+        assert!(warned, "只提示模式仍应显示倒计时");
+        assert!(!locked, "只提示模式绝不锁屏");
+    }
+
+    #[test]
+    fn posture_warning_secs_is_configurable_and_reports_distance() {
+        let t0 = Instant::now();
+        let mut cfg = Config::default();
+        cfg.posture_warning_secs = 4.0;
+        let mut w = Watcher::new(cfg.clone());
+        let close = FaceBox { x: 0.30, y: 0.20, w: 0.16 * 1.5, h: 0.32 * 1.5 };
+        let mut d = FakeDetector::new(vec![vec![close]]);
+        let c = ctrl_with(cfg);
+        let mut s = Snapshot::default();
+        for i in 0..=4 { s = step(&mut w, &mut d, t0, 0.5 * i as f64, Some(bright()), &c).0; }
+        assert!(!s.posture, "2 秒不足 4 秒阈值，不应闪烁提示");
+        assert!(s.posture_closeness > 1.4, "应给出当前距离倍率");
+        for i in 5..=10 { s = step(&mut w, &mut d, t0, 0.5 * i as f64, Some(bright()), &c).0; }
+        assert!(s.posture, "持续 4 秒后提示");
+    }
+
+    #[test]
+    fn wellness_reminds_after_break_and_restarts_when_dismissed() {
+        let t0 = Instant::now();
+        let mut cfg = Config::default();
+        cfg.wellness_enabled = true;
+        cfg.wellness_break_secs = 6.0;
+        cfg.wellness_rest_secs = 2.0;
+        let mut w = Watcher::new(cfg.clone());
+        let mut d = FakeDetector::new(vec![vec![owner()]]);
+        let c = ctrl_with(cfg);
+        step(&mut w, &mut d, t0, 0.0, Some(bright()), &c);
+        let mut s = Snapshot::default();
+        for i in 1..=14 { s = step(&mut w, &mut d, t0, 0.5 * i as f64, Some(bright()), &c).0; }
+        assert!(s.wellness_due, "连续在座达到阈值应提醒远眺");
+        let mut c2 = c.clone();
+        c2.dismissed.insert(Kind::Wellness, s.wellness_epoch);
+        s = step(&mut w, &mut d, t0, 7.5, Some(bright()), &c2).0;
+        assert!(!s.wellness_due, "点击消除后不再打扰");
+        assert!(s.wellness_secs < 1.0, "消除后重新累计用眼时长");
+    }
+
+    #[test]
+    fn auto_mute_and_dim_track_away_state() {
+        let t0 = Instant::now();
+        let mut cfg = Config::default();
+        cfg.auto_mute_enabled = true;
+        cfg.lock_after_secs = 20.0;
+        cfg.countdown_after_secs = 5.0;
+        let mut w = Watcher::new(cfg.clone());
+        let mut d = FakeDetector::new(vec![vec![owner()], vec![]]);
+        let c = ctrl_with(cfg);
+        let s0 = step(&mut w, &mut d, t0, 0.0, Some(bright()), &c).0;
+        assert!(!s0.mic_mute && s0.dim_progress == 0.0);
+        let mut s = Snapshot::default();
+        for i in 1..=20 { s = step(&mut w, &mut d, t0, 0.5 * i as f64, Some(bright()), &c).0; }
+        assert!(s.mic_mute, "离席应要求保护性静音");
+        assert!(s.dim_progress > 0.0 && s.dim_progress <= 1.0, "渐强进度应增长");
+        let mut back = FakeDetector::new(vec![vec![owner()]]);
+        let s2 = step(&mut w, &mut back, t0, 10.5, Some(bright()), &c).0;
+        assert!(!s2.mic_mute, "回来应解除静音");
+        assert_eq!(s2.dim_progress, 0.0);
+    }
+
+    #[test]
     fn posture_enters_and_clears_with_hysteresis() {
         let t0 = Instant::now();
         let mut w = Watcher::new(Config::default());
@@ -1046,12 +1375,22 @@ mod tests {
         c.lock_after_secs = 45.0;
         c.posture_baseline_w = 0.184375;
         c.posture_calibrated = true;
+        c.posture_warning_secs = 4.5;
+        c.lock_enabled = false;
+        c.behind_face_confirm = 3;
+        c.wellness_enabled = true;
+        c.auto_mute_enabled = true;
         c.save();
         let loaded = Config::load();
         assert!(loaded.enabled);
         assert_eq!(loaded.lock_after_secs, 45.0);
         assert!((loaded.posture_baseline_w - 0.184375).abs() < 1e-6);
         assert!(loaded.posture_calibrated);
+        assert_eq!(loaded.posture_warning_secs, 4.5);
+        assert!(!loaded.lock_enabled);
+        assert_eq!(loaded.behind_face_confirm, 3);
+        assert!(loaded.wellness_enabled);
+        assert!(loaded.auto_mute_enabled);
         match old { Some(v) => std::env::set_var("DAOZAI_DATA_DIR", v), None => std::env::remove_var("DAOZAI_DATA_DIR") }
         let _ = std::fs::remove_dir_all(&dir);
     }

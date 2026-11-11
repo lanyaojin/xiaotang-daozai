@@ -148,3 +148,23 @@ The BLOCKED report above is historical and fully resolved:
 - Build: skipped-no-msvc-linker (GitHub Actions verifies after push)
 - Push: no
 - Feature overlap: none detected
+
+## 2026-11-11 15:11
+- Upstream: f046d6cb972ceeee99fd1c02aafcf6afc8ee6e80
+- New upstream commits: 0
+- Merge: merged
+- Build: skipped-no-msvc-linker (GitHub Actions verifies after push)
+- Push: yes
+- Feature overlap: none detected
+
+## 2026-11-11 15:25 CI 验证与重叠评估（自动化补记）
+
+- 构建在场保护版本 run 42977396157（HEAD 5edf5a7）：completed / **success**。
+  - 步骤「在场保护逻辑测试」成功（07:09:34Z–07:14:42Z，5m08s）。
+  - 步骤「构建 release 主程序」成功（07:14:42Z–07:23:37Z，8m55s）。
+  - 「上传可执行文件」成功；job 于 07:23:42Z 结束。无失败 job，无需下载失败日志。
+- Windows 检查 run 42977396088：in_progress（按指令不等待完成）。
+  - installer job：success；test job：步骤 1–7 全部 success，「验证发布构建与打包」仍 in_progress。
+- 本周上游：upstream/main 仍为 f046d6c（2026-11-10 12:13），自上次同步后 0 个新提交；`HEAD..upstream/main`=0，合并结果为 Already up to date。
+- 功能重叠：无。上游无摄像头/在场模块，Cargo.toml 无 nokhwa / LockWorkStation / FaceDetector 依赖；关键词仅命中 src/model.rs 与 src/side_dock.rs 的毛玻璃文案「身后桌面的颜色 / 身后明暗」，均为误报。自研三项功能保留，不建议执行 drop-presence.ps1。
+- TODO：脚本成功运行会追加本报告但不提交，当前 docs/UPSTREAM_SYNC.md 为未提交修改；下周运行前需提交（或修改脚本自动提交），否则 clean-tree 守卫会再次阻断。
