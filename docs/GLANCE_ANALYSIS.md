@@ -117,3 +117,37 @@ FEATURE_SMART_POINTER / FEATURE_SNAP_WINDOW / FEATURE_VIRTUAL_PRESENTER  ← 眼
 旧版代码 `evidence = (other_faces > 0 || blob) && !global_change`：
 只要背景差分出现运动块就计为身后证据，主人打字、耸肩、光影变化都会被累计到红字。
 Glance 从不做这种「纯运动块」判定——它以第二个人为中心。v5 已改为必须有非主人的第二张脸。
+
+**2026-11-11 17:00 真机验收**：用户报告「随意移动、打字耸肩没出现身后有人提示」，
+随后「有人来找签字，确实显示身后有人并做了提醒」。误报与正报双向通过，
+身后检测方案定稿，后续不再改动。
+
+## 七、眼动追踪（POI_USED_GAZE）为何没有移植
+
+用户指出本机 Windows Hello 摄像头支持眼动追踪、Glance 曾在此机使用。实测核查：
+
+| 检查 | 结果 |
+| --- | --- |
+| 设备管理器 | 存在 `Integrated Camera`（`USB\VID_174F&PID_1812&MI_00`）与 **`Integrated IR Camera`**（同设备 `MI_02`）——确实是 RGB+IR 双通道 |
+| 标准 Media Foundation 枚举 | 只返回 `Integrated Camera`；`presence.log` 全历史均为 `camera devices: Integrated Camera (non-IR preferred)`，**IR 通道不对标准采集 API 暴露** |
+| Windows Eye Control | `HKCU\...\EyeControl` 不存在；无 Tobii / Mirametrix / Glance 相关服务或驱动在运行 |
+| WinRT `FaceDetector` | 官方 API 只有 `CreateAsync` / `DetectFacesAsync` / 格式查询，返回 `DetectedFace.FaceBox`，**无视线方向、无头部姿态、无瞳孔数据** |
+| Windows Hello IR | 仅用于登录时的人脸认证（±15° 正脸检查），不对外提供 gaze 数据流 |
+
+Glance 的注视能力来自它自己的链路：154 MB 私有增强驱动 +
+`NISDK.dll` + 加密分类模型 + `SharedMemoryCameraLibrary` / `FSCameraLibrary` /
+`UVCCameraLibrary`，从 IR 帧计算注视点（`NIKROITracker`、`NIKFixationHandler`、
+`NIKGazeArea::PogType::PT_FIXATION`），并通过 `FEATURE_PRESENCE_DETECTION_POI_USED_GAZE`
+把注视点作为在场/休息判据。**这条链路不通过任何 Windows 公开 API 暴露**。
+
+因此岛仔的取舍：
+
+- 不移植真 gaze：需要私有驱动 + 150 MB 以上依赖 + 模型，与单文件 19 MB 的轻量目标直接冲突，
+  且涉及第三方闭源组件，合规与稳定性都不可控。
+- 复刻 Glance 的**降级档位**：`POI_USED_PRESENCE`（人在座即算用眼）与
+  `POI_USED_HEAD`（本拍检测到主人正脸才算看屏幕，转头远眺即算休息）。
+  配置项 `wellness_poi`，默认 HEAD 档；`Snapshot.attending` 可在设置页看到当前注意力状态。
+- 由此，Digital Wellness 的「是否休息」不再只看离席：坐在座位上转头远眺也能重置用眼计时，
+  符合 20-20-20 的本意。
+- 保留的可选路线：若将来愿意安装那个私有驱动，可评估其共享内存接口能否只读取得
+  IR 帧或注视点；届时需重新评估体量、稳定性与合规性，本版不做。

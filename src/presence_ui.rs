@@ -50,9 +50,13 @@ impl App {
         crate::extras::setting_number(ui, "身影检测阈值", &mut cfg.behind_motion, 6.0, 60.0, "", 2.0);
         crate::extras::settings_hint(ui, "模拟 Glance 的左右肩后 ROI + 多用户置信度。没有第二张脸时，打字、光影、宠物一律不提示（修复 11-11 误报）。画面太暗或检测不可用时保护暂停，不会误锁屏。");
         ui.separator();
-        crate::extras::setting_row(ui, "用眼时长提醒（Digital Wellness）", "连续在座达到设定时长后提醒抬头远眺，离开一会儿自动重置", &mut cfg.wellness_enabled);
+        crate::extras::setting_row(ui, "用眼时长提醒（Digital Wellness）", "连续看屏幕达到设定时长后提醒抬头远眺，视线离开一会儿自动重置", &mut cfg.wellness_enabled);
         crate::extras::setting_number(ui, "连续用眼提醒间隔", &mut cfg.wellness_break_secs, 60.0, 7200.0, " 秒", 60.0);
-        crate::extras::setting_number(ui, "离席多久算休息", &mut cfg.wellness_rest_secs, 5.0, 300.0, " 秒", 5.0);
+        crate::extras::setting_number(ui, "视线离开多久算休息", &mut cfg.wellness_rest_secs, 5.0, 300.0, " 秒", 5.0);
+        let mut head_poi = cfg.wellness_poi == 1;
+        crate::extras::setting_row(ui, "按正脸判定用眼（POI_USED_HEAD）", "开启：本拍检测到主人正脸才算看屏幕，转头远眺或低头即算休息；关闭：只要人在座就算用眼", &mut head_poi);
+        cfg.wellness_poi = head_poi as u8;
+        crate::extras::settings_hint(ui, "眼动追踪（POI_USED_GAZE）需外接 RGB-IR 眼动仪与私有驱动/模型；本机 Windows Hello 的 IR 摄像头只用于登录，标准接口不提供视线数据，因此用「正脸 / 在场」两档近似，不引入额外依赖。");
         crate::extras::setting_row(ui, "离席自动静音麦克风（Auto Mute）", "离席时静音默认麦克风，回来恢复；不会覆盖你原本的静音设置", &mut cfg.auto_mute_enabled);
         ui.separator();
         ui.label(egui::RichText::new(format!("状态：{}", self.presence.status_line())).size(11.5));
@@ -66,6 +70,7 @@ impl App {
             }
             if cfg.wellness_enabled {
                 parts.push(format!("连续用眼 {:.0} 分钟", (s.wellness_secs / 60.0).floor()));
+                parts.push(if s.attending { "注视屏幕".to_string() } else { "视线离开".to_string() });
             }
             if s.mic_mute { parts.push("麦克风已保护性静音".into()); }
             if !parts.is_empty() {

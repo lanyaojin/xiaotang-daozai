@@ -77,8 +77,12 @@ pub struct Config {
     pub wellness_enabled: bool,
     /// 连续在座多久提醒远眺，默认 20 分钟。
     pub wellness_break_secs: f64,
-    /// 离席多久算完成一次休息，默认 20 秒。
+    /// 视线离开多久算完成一次休息，默认 20 秒。
     pub wellness_rest_secs: f64,
+    /// 用眼判定的「关注点」信号（模拟 Glance FEATURE_PRESENCE_DETECTION_POI_USED_*）：
+    /// 0 = PRESENCE（人在座即算用眼），1 = HEAD（本拍检测到正脸才算看屏幕）。
+    /// GAZE 档需专用眼动仪与私有 SDK，本机不提供，故不实现。
+    pub wellness_poi: u8,
     /// Auto Mute：离席自动静音麦克风，回来自动恢复。
     pub auto_mute_enabled: bool,
 }
@@ -103,6 +107,7 @@ impl Default for Config {
             wellness_enabled: false,
             wellness_break_secs: 1200.0,
             wellness_rest_secs: 20.0,
+            wellness_poi: 1,
             auto_mute_enabled: false,
         }
     }
@@ -121,6 +126,8 @@ impl Config {
         self.behind_face_confirm = self.behind_face_confirm.clamp(1, 12);
         self.wellness_break_secs = self.wellness_break_secs.clamp(60.0, 7200.0);
         self.wellness_rest_secs = self.wellness_rest_secs.clamp(5.0, 300.0);
+        // 2 = GAZE 需要外接眼动仪，本机不支持，回退到 HEAD 档。
+        self.wellness_poi = self.wellness_poi.min(1);
     }
 
     fn path() -> PathBuf {
@@ -145,6 +152,7 @@ impl Config {
                 "wellness_enabled" => c.wellness_enabled = v == "1",
                 "wellness_break_secs" => c.wellness_break_secs = v.parse().unwrap_or(c.wellness_break_secs),
                 "wellness_rest_secs" => c.wellness_rest_secs = v.parse().unwrap_or(c.wellness_rest_secs),
+                "wellness_poi" => c.wellness_poi = v.parse().unwrap_or(c.wellness_poi),
                 "auto_mute_enabled" => c.auto_mute_enabled = v == "1",
                 "posture_ratio" => c.posture_ratio = v.parse().unwrap_or(c.posture_ratio),
                 "posture_baseline_w" => c.posture_baseline_w = v.parse().unwrap_or(c.posture_baseline_w),
@@ -167,7 +175,7 @@ impl Config {
             c
         };
         let text = format!(
-            "enabled={}\nlock_after_secs={}\ncountdown_after_secs={}\nlock_enabled={}\nposture_enabled={}\nposture_ratio={}\nposture_baseline_w={}\nposture_baseline_h={}\nposture_calibrated={}\nposture_warning_secs={}\nbehind_enabled={}\nbehind_motion={}\nbehind_min_cells={}\nbehind_face_confirm={}\nwellness_enabled={}\nwellness_break_secs={}\nwellness_rest_secs={}\nauto_mute_enabled={}\n",
+            "enabled={}\nlock_after_secs={}\ncountdown_after_secs={}\nlock_enabled={}\nposture_enabled={}\nposture_ratio={}\nposture_baseline_w={}\nposture_baseline_h={}\nposture_calibrated={}\nposture_warning_secs={}\nbehind_enabled={}\nbehind_motion={}\nbehind_min_cells={}\nbehind_face_confirm={}\nwellness_enabled={}\nwellness_break_secs={}\nwellness_rest_secs={}\nwellness_poi={}\nauto_mute_enabled={}\n",
             c.enabled as u8,
             c.lock_after_secs,
             c.countdown_after_secs,
@@ -185,6 +193,7 @@ impl Config {
             c.wellness_enabled as u8,
             c.wellness_break_secs,
             c.wellness_rest_secs,
+            c.wellness_poi,
             c.auto_mute_enabled as u8,
         );
         let path = Self::path();
@@ -366,6 +375,8 @@ pub struct Snapshot {
     pub wellness_secs: f64,
     pub wellness_due: bool,
     pub wellness_epoch: u64,
+    /// 本拍是否判定为「正在看屏幕」（模拟 Glance POI 的注意力状态）。
+    pub attending: bool,
     /// 当前应处于「保护性静音」状态（模拟 Glance AUTO_MUTE）。
     pub mic_mute: bool,
 }
@@ -582,16 +593,30 @@ impl Watcher {
             }
         }
 
-        // ---- Digital Wellness：连续用眼统计与远眺提醒 ----
+        // ---- Digital Wellness：模拟 Glance POI_USED_PRESENCE / POI_USED_HEAD ----
+        // 真 POI_USED_GAZE 需外接 RGB-IR 眼动仪 + 私有驱动/模型：本机虽有
+        // Integrated IR Camera，但标准 Media Foundation 只枚举到 RGB 通道，
+        // WinRT FaceDetector 也只返回脸框（无视线/头部姿态），故用两档近似：
+        //   PRESENCE(0)：人在座即算用眼（旧行为）；
+        //   HEAD(1)    ：本拍必须检测到主人正脸，转头远眺/低头即视为视线离开。
+        let owner_face_seen = !paused && faces.iter().any(|f| {
+            owner_box.is_some_and(|o| o.matches(f))
+        });
+        let attending = if self.config.wellness_poi == 1 {
+            owner_face_seen
+        } else {
+            self.owner_present
+        };
         if self.wellness_due && ctrl.hidden(Kind::Wellness, self.wellness_epoch) {
             self.wellness_due = false;
             self.wellness_accum = 0.0;
         }
         if !paused {
-            if self.owner_present {
+            if attending {
                 self.wellness_accum += dt;
                 self.wellness_rest = 0.0;
             } else if self.owner_ever {
+                // 视线离开（转头远眺）与离席一样，都累计为休息时间。
                 self.wellness_rest += dt;
                 if self.wellness_rest >= self.config.wellness_rest_secs {
                     self.wellness_accum = 0.0;
@@ -712,6 +737,7 @@ impl Watcher {
             wellness_secs: self.wellness_accum,
             wellness_due: self.wellness_due,
             wellness_epoch: self.wellness_epoch,
+            attending,
             mic_mute,
         };
         // 点击消除：按事件 epoch 抑制，事件结束后自动恢复。
@@ -1325,6 +1351,50 @@ mod tests {
     }
 
     #[test]
+    fn wellness_head_poi_counts_look_away_as_rest() {
+        // 坐在座位上转头远眺：人没离席，但正脸消失 → 应算休息并重置用眼计时。
+        let t0 = Instant::now();
+        let mut cfg = Config::default();
+        cfg.wellness_enabled = true;
+        cfg.wellness_break_secs = 6.0;
+        cfg.wellness_rest_secs = 2.0;
+        cfg.wellness_poi = 1;
+        let mut w = Watcher::new(cfg.clone());
+        let mut d = FakeDetector::new(vec![vec![owner()], vec![]]);
+        let c = ctrl_with(cfg);
+        step(&mut w, &mut d, t0, 0.0, Some(bright()), &c);
+        let mut s = Snapshot::default();
+        for i in 1..=12 { s = step(&mut w, &mut d, t0, 0.5 * i as f64, Some(bright()), &c).0; }
+        assert!(!s.attending, "主人正脸消失应判定为视线离开");
+        assert_eq!(s.wellness_secs, 0.0, "持续视线离开应重置用眼计时，而不是继续累加");
+    }
+
+    #[test]
+    fn wellness_presence_poi_ignores_brief_look_away() {
+        let t0 = Instant::now();
+        let mut cfg = Config::default();
+        cfg.wellness_enabled = true;
+        cfg.wellness_break_secs = 100.0;
+        cfg.wellness_rest_secs = 2.0;
+        cfg.wellness_poi = 0;
+        let mut w = Watcher::new(cfg.clone());
+        let mut d = FakeDetector::new(vec![vec![owner()], vec![]]);
+        let c = ctrl_with(cfg);
+        step(&mut w, &mut d, t0, 0.0, Some(bright()), &c);
+        let s = step(&mut w, &mut d, t0, 0.5, Some(bright()), &c).0;
+        assert!(s.attending, "PRESENCE 档在人脸漏检容错期内仍算在用眼");
+        assert!(s.wellness_secs > 0.0);
+    }
+
+    #[test]
+    fn gaze_poi_falls_back_to_head_without_eye_tracker() {
+        let mut cfg = Config::default();
+        cfg.wellness_poi = 2;
+        cfg.sanitize();
+        assert_eq!(cfg.wellness_poi, 1, "无眼动仪时 GAZE 档回退到 HEAD 档");
+    }
+
+    #[test]
     fn auto_mute_and_dim_track_away_state() {
         let t0 = Instant::now();
         let mut cfg = Config::default();
@@ -1379,6 +1449,7 @@ mod tests {
         c.lock_enabled = false;
         c.behind_face_confirm = 3;
         c.wellness_enabled = true;
+        c.wellness_poi = 0;
         c.auto_mute_enabled = true;
         c.save();
         let loaded = Config::load();
@@ -1390,6 +1461,7 @@ mod tests {
         assert!(!loaded.lock_enabled);
         assert_eq!(loaded.behind_face_confirm, 3);
         assert!(loaded.wellness_enabled);
+        assert_eq!(loaded.wellness_poi, 0);
         assert!(loaded.auto_mute_enabled);
         match old { Some(v) => std::env::set_var("DAOZAI_DATA_DIR", v), None => std::env::remove_var("DAOZAI_DATA_DIR") }
         let _ = std::fs::remove_dir_all(&dir);

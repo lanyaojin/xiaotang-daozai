@@ -268,3 +268,49 @@ exe 体积保持在约 19 MB。
 
 > 每周同步的 WorkBuddy 定时任务目前仍为 PAUSED；本次以手动审计代替，
 > 待用户确认后再恢复自动调度。所有提交只推送 `origin/presence-v2`，未推上游。
+
+## 十一、17:00 真机验收与 Digital Wellness 注意力升级
+
+### 身后检测真机验收通过（方案定稿）
+
+用户回到座位后报告：
+
+- **误报根除**：随意移动、打字、耸肩，均**没有**出现「身后有人」提示。
+- **正报有效**：有人来找签字时，**确实显示身后有人并完成提醒**。
+
+至此身后检测的白/黄/红分级在真机上双向验证通过（无误报、有正报），
+模拟 Glance「左右 ROI + 多用户第二张脸」的方案**定稿，后续不再改动**。
+第十节中「仍需用户确认」的第 1、2 项已闭环。
+
+### 用户提问：Glance 的眼动追踪是否复刻
+
+用户指出本机 Windows Hello 摄像头支持眼动追踪，且认为注视是「是否休息」的严谨判据。
+实测核查结论（详见 [GLANCE_ANALYSIS.md](GLANCE_ANALYSIS.md) 第七节）：
+
+- 本机确有 `Integrated IR Camera`（与 RGB 同一 USB 复合设备 `VID_174F&PID_1812` 的 `MI_02`），
+  用户所述硬件属实。
+- 但标准 Media Foundation 只枚举到 `Integrated Camera`，**IR 通道不对标准采集 API 暴露**；
+  系统无 Eye Control 配置、无眼动/Glance 驱动服务。
+- 微软 `FaceDetector` 只返回脸框，无视线/头部姿态；Windows Hello 的 IR 仅用于登录认证。
+- Glance 的注视点来自私有驱动 + `NISDK.dll` + 加密模型自行计算，不通过公开 API 暴露。
+
+结论：**真 `POI_USED_GAZE` 不移植**（需 150MB+ 私有依赖与模型，与 19 MB 轻量目标冲突）；
+改为复刻 Glance 自带的两档降级判据。
+
+### v6 改动：Digital Wellness 的 POI 两档
+
+| 档位 | 判据 | 对应 Glance |
+| --- | --- | --- |
+| `wellness_poi=0` | 人在座即算用眼 | `POI_USED_PRESENCE` |
+| `wellness_poi=1`（默认） | 本拍必须检测到主人正脸；转头远眺/低头即视为视线离开 | `POI_USED_HEAD` |
+| `2` | 真 gaze，本机不可用，`sanitize()` 回退到 1 | `POI_USED_GAZE`（不实现） |
+
+- 「视线离开」与「离席」一样累计休息时间，达到 `wellness_rest_secs` 即重置连续用眼计时。
+  坐在座位上转头远眺也能算休息，符合 20-20-20 的本意。
+- `Snapshot.attending` 暴露当前注意力状态，设置页显示「注视屏幕 / 视线离开」。
+- 设置页新增「按正脸判定用眼」开关与眼动追踪不可用的说明；配置向后兼容。
+- 新增 3 项单测：视线离开算休息、PRESENCE 档忽略短暂漏检、GAZE 档回退；
+  `config_roundtrip` 增补 `wellness_poi`。
+
+本地校验：`rustfmt` 语法解析通过；纯 std 桩 crate 的 `rustc --emit metadata`
+（含 `--cfg test`）类型/借用检查通过。单测与 release 构建由 CI 执行。
