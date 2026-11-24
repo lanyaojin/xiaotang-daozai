@@ -168,3 +168,17 @@ The BLOCKED report above is historical and fully resolved:
 - 本周上游：upstream/main 仍为 f046d6c（2026-11-10 12:13），自上次同步后 0 个新提交；`HEAD..upstream/main`=0，合并结果为 Already up to date。
 - 功能重叠：无。上游无摄像头/在场模块，Cargo.toml 无 nokhwa / LockWorkStation / FaceDetector 依赖；关键词仅命中 src/model.rs 与 src/side_dock.rs 的毛玻璃文案「身后桌面的颜色 / 身后明暗」，均为误报。自研三项功能保留，不建议执行 drop-presence.ps1。
 - TODO：脚本成功运行会追加本报告但不提交，当前 docs/UPSTREAM_SYNC.md 为未提交修改；下周运行前需提交（或修改脚本自动提交），否则 clean-tree 守卫会再次阻断。
+
+## 2026-11-24 09:30 手动同步（v0.6.63 → v0.6.66）
+
+- Upstream before: f046d6cb972ceeee99fd1c02aafcf6afc8ee6e80 (v0.6.63)
+- Upstream after: 080e94020547d55c13346c604ed4417e583d065e (v0.6.66, +3 tags)
+- New upstream commits: **153** (178 files, ~28,000 insertions)
+- Merge: merged via commit c83390d (two-parent), rollback tag `pre-merge-v066-20261124`
+- Conflicts resolved: `.gitignore`, `Cargo.toml`, `Cargo.lock`, `src/app.rs` (all kept both sides); extras.rs/lib.rs/main.rs auto-merged.
+- Version bumped to 0.6.66 (Cargo.toml + app.rc).
+- Feature overlap: **none**. Upstream health reminder uses idle_seconds() + screen_locked() (input/session-based); local presence uses webcam face boxes. No nokhwa/FaceDetector/LockWorkStation upstream; drop-presence.ps1 conditions not met.
+- Optimizations: Auto Mute residual-mute flag (c7b019d); Cargo.lock rebuilt for --locked (4376e36).
+- Local verification: rustfmt syntax OK; std-stub rustc type check 0 errors; cargo metadata/tree --locked OK. No MSVC linker locally.
+- Push: yes, only to origin/presence-v2 (upstream push disabled).
+- Build/CI: **BLOCKED** — GitHub Actions disabled at repo level (dispatch 422, workflows state active but disabled; API re-enable ineffective). No local MSVC toolchain → cannot produce exe. Need repo owner to re-enable Actions in web settings.
