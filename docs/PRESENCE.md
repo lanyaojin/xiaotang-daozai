@@ -452,3 +452,42 @@ auto_mute_enabled=1   wellness_poi=1
 改动集中在 `src/presence.rs`（`Config::mic_mute_flag` / `mark_mic_muted` + `run()` 三处调用），
 零新依赖、零体积影响。本地校验：`rustfmt` 语法解析通过；纯 std 桩 crate 的
 `rustc --emit metadata --cfg test` 类型/借用检查 0 错误。单测与 release 构建由 CI 执行。
+
+## 十四、2026-11-24 10:21：v0.6.66 合并版上线本机
+
+### Actions 恢复过程（fork 仓库特有问题）
+
+- 推送后两个 workflow 均未触发，dispatch 返回 `422 Actions has been disabled for this repository`。
+- `actions/permissions` 显示 `enabled:true`、workflow `active`，PUT 启用无效 → 不是权限配置问题。
+- **根因**：本仓库是 fork，GitHub 对 fork 的默认策略是「Workflows on this fork have been disabled」
+  （为节省算力，fork 继承的上游 workflow 默认不运行）。入口不在 Settings，而在
+  **顶部导航 Actions 标签页**的横幅，点击绿色按钮
+  **"I understand my workflows, go ahead and re-enable them"** 后恢复。
+- 恢复后：`presence-build.yml` dispatch 返回 204；`ci.yml` 无 workflow_dispatch（靠 push 触发）。
+  此后 push 到 presence-v2 会自动触发两个 workflow。
+
+### CI 与产物
+
+| 项目 | 值 |
+| --- | --- |
+| 产物构建 | run `45309787071` **completed success**（在场保护单测 + release 构建 + 上传全通过） |
+| Windows 检查 | run `45309786938`：installer job success；test job 运行中（合并后全量测试耗时更长） |
+| 产物 | `dist/daozai-v066.zip` 11,773,494 B → `dist/v066-extract/daozai.exe` |
+| 安装文件 | **22,881,792 B（21.8 MB）**，SHA256 `be44a29d6eb1a437d7d20d538a6c48182b719b324c962c7532acde10aa9f414f` |
+| 体积结论 | 合并 153 个上游提交后从 19.06 MB 增至 21.8 MB，**仍低于 30 MB 上限** |
+| 回滚点 | `dist/daozai-v6-installed-backup-20261124.exe`（19,063,296 B，`dc254e5c…`） |
+
+### 安装与验证
+
+- 启动方式：计划任务 `DaozaiDevTest`，**PID 17564**，父进程 2664（svchost），10:21:04；
+  用户的 HKCU Run 自启动项 `Daozai` 仍保留，两种机制均可用。
+- 配置**原样保留**用户当前值，未做任何改动：`lock_after_secs=25`、坐姿基线
+  `0.19375/0.39167`（用户重新校准过）、`posture_ratio=1.3`、`behind_enabled=1`、
+  `behind_motion=20`、`wellness_enabled=0`（用户主动关闭）、`wellness_poi=1`、
+  `auto_mute_enabled=1`。
+- 版本信息：`ProductVersion/FileVersion = 0.6.66`，确认上游版本已生效。
+- 摄像头链路：`[1795486865] camera devices: Integrated Camera (non-IR preferred)` →
+  `FaceDetector ready (MTA)` → `camera opened: Integrated Camera`，无帧错误、无 COM/MTA 报错。
+- 资源：`pid=17564` 2 次采样，`abnormal=true` 0 次。
+- 静音残留修复：旧版不写标记，故本次启动无 `restored leftover` 日志，符合预期；
+  新标记机制从本次运行起生效，后续强杀/关机场景才有保护作用。
