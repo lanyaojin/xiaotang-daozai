@@ -134,6 +134,22 @@ impl Config {
         crate::model::config_dir().join("presence.txt")
     }
 
+    /// Auto Mute 静音标记：记录「麦克风当前由本程序静音」。
+    /// 进程被强杀 / 直接关机时 run() 的退出清理不会执行，下次启动据此恢复，
+    /// 避免麦克风一直静音。正常恢复或退出时删除。
+    fn mic_mute_flag() -> PathBuf {
+        crate::model::config_dir().join("presence-mic-muted.flag")
+    }
+
+    fn mark_mic_muted(muted: bool) {
+        let flag = Self::mic_mute_flag();
+        if muted {
+            let _ = std::fs::write(&flag, b"1");
+        } else {
+            let _ = std::fs::remove_file(&flag);
+        }
+    }
+
     pub fn load() -> Self {
         let mut c = Self::default();
         let text = std::fs::read_to_string(Self::path()).unwrap_or_default();
@@ -910,6 +926,13 @@ fn run(stop: Arc<AtomicBool>, control: Arc<Mutex<Control>>, shared: Arc<Mutex<Op
     let mut last_lock_attempt: Option<Instant> = None;
     // Auto Mute：只记录「由我们静音」的状态，绝不覆盖用户原本的静音设置。
     let mut we_muted_mic = false;
+    // 强杀 / 关机残留恢复：若上次退出时麦克风由本程序静音且未正常清理，
+    // 本次启动无条件解除并清标记，避免用户一直处于静音。
+    if crate::model::config_dir().join("presence-mic-muted.flag").exists() {
+        let _ = crate::presence_backend::set_mic_mute(false);
+        Config::mark_mic_muted(false);
+        crate::presence_backend::log("auto mute: restored leftover mute from previous session");
+    }
 
     loop {
         if stop.load(Ordering::Relaxed) { break; }
@@ -925,11 +948,13 @@ fn run(stop: Arc<AtomicBool>, control: Arc<Mutex<Control>>, shared: Arc<Mutex<Op
                 && crate::presence_backend::set_mic_mute(true)
             {
                 we_muted_mic = true;
+                Config::mark_mic_muted(true);
                 crate::presence_backend::log("auto mute: mic muted while away");
             }
         } else if !snap.mic_mute && we_muted_mic {
             if crate::presence_backend::set_mic_mute(false) {
                 we_muted_mic = false;
+                Config::mark_mic_muted(false);
                 crate::presence_backend::log("auto mute: mic restored on return");
             }
         }
@@ -943,7 +968,10 @@ fn run(stop: Arc<AtomicBool>, control: Arc<Mutex<Control>>, shared: Arc<Mutex<Op
         std::thread::sleep(TICK.saturating_sub(started.elapsed()));
     }
     // 退出前一定把麦克风恢复，避免服务停止后用户一直处于静音。
-    if we_muted_mic { let _ = crate::presence_backend::set_mic_mute(false); }
+    if we_muted_mic {
+        let _ = crate::presence_backend::set_mic_mute(false);
+        Config::mark_mic_muted(false);
+    }
     crate::presence_backend::log("presence watcher stopped");
 }
 

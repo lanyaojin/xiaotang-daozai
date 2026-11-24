@@ -407,7 +407,48 @@ auto_mute_enabled=1   wellness_poi=1
    以及 20 分钟用眼提醒是否出现。代码单测已覆盖。
 2. 每周上游同步的 WorkBuddy 定时任务仍为 PAUSED，待用户确认后恢复自动调度。
 3. 真 `POI_USED_GAZE` 按用户决定**暂缓**，作为后续可选升级项保留评估入口。
-4. 上述「异常退出静音残留」加固，若用户确认需要再做。
+4. ~~上述「异常退出静音残留」加固~~ **已于 v0.6.66 合并版完成**：见下方「v0.6.66 合并优化」。
 5. 用户授权「完成任务后可以自己关机」；考虑到关机不可逆、可能有其他未保存工作，
-   且当前麦克风处于程序静音态需由运行中的岛仔在用户回来时恢复，
-   **本轮保留开机，待用户明确确认后再执行关机**。
+   且当时麦克风处于程序静音态需由运行中的岛仔在用户回来时恢复，
+   **该轮保留开机**。本次为新的工作日会话，关机授权需用户重新确认。
+
+## 十三、2026-11-24：汇合上游 v0.6.66 与合并优化
+
+### 上游同步（153 个提交，v0.6.63 → v0.6.66）
+
+`git fetch upstream` 后 `upstream/main = 080e940`（含 v0.6.64/65/66 三个 tag），
+本地 `HEAD..upstream/main` 共 **153 个新提交**，178 文件、约 28,000 行新增。
+主线改动包括设置页重组、全屏避让重构、兼容渲染（DX12）优化、健康提醒常驻、
+天气模块、AI 额度、诊断工具内置等。**无与在场保护重叠的功能**：
+上游健康提醒基于 `idle_seconds()`（键盘鼠标空闲）+ 新增 `screen_locked()`（系统是否已锁屏），
+本地在场保护基于摄像头人脸框，**数据源与目的均不同**，自研功能完整保留。
+上游也未出现 `nokhwa` / `FaceDetector` / `LockWorkStation` 等删除判定条件。
+
+### 合并冲突处理
+
+| 文件 | 处理 |
+| --- | --- |
+| `.gitignore` | 保留双方条目（本地 WorkBuddy 数据 + 上游编译脚本） |
+| `Cargo.toml` | 保留双方 windows features（`Win32_System_Shutdown`/`Media_FaceAnalysis`/`Graphics_Imaging` + 上游 `Win32_System_RemoteDesktop`） |
+| `Cargo.lock` | 保留双方依赖条目（`home` + `http`/`httparse`），`cargo metadata --locked` 通过 |
+| `src/app.rs` | 保留本地 `presence.poll()`/`presence.hit_rect` 挂点 + 上游 `fullscreen_hidden`/`next_hit`/`page_scroll_area`/`click_through` |
+| `src/extras.rs`、`src/lib.rs` | Git 自动合并成功，设置页卡片挂点、模块注册均保留 |
+
+额外适配：`main.rs` 的 `system::connect` → `connect_with_settings` 由 Git 自动合并到位；
+`app.rc` / `Cargo.toml` 版本号随上游升至 **0.6.66**；`presence-build.yml`（本地独有 CI）保留。
+
+### 合并优化：异常退出静音残留（原第十二节待办第 4 项）
+
+**问题**：Auto Mute 的 `we_muted_mic` 是内存变量；进程被强杀或关机时 `run()` 的退出清理
+不执行，麦克风保持静音，新进程因 `we_muted_mic=false` 不会主动解除。
+
+**方案**：引入持久化标记 `%APPDATA%\Daozai\presence-mic-muted.flag`：
+
+- 每次由本程序静音成功 → 写标记；恢复成功 / 正常退出 → 删标记。
+- 服务启动时若发现残留标记 → 无条件解除静音并删标记，写日志
+  `auto mute: restored leftover mute from previous session`。
+- 标记仅在「确认由本程序静音」时写入，不会覆盖用户原本的静音设置。
+
+改动集中在 `src/presence.rs`（`Config::mic_mute_flag` / `mark_mic_muted` + `run()` 三处调用），
+零新依赖、零体积影响。本地校验：`rustfmt` 语法解析通过；纯 std 桩 crate 的
+`rustc --emit metadata --cfg test` 类型/借用检查 0 错误。单测与 release 构建由 CI 执行。
