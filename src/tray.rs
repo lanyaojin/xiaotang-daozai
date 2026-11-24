@@ -68,6 +68,7 @@ struct Ctx {
     state: Arc<Mutex<State>>,
     taskbar_msg: u32,
     hicon: HICON,
+    before_exit: Box<dyn Fn() + Send>,
     added: AtomicBool,
     adds: AtomicU32,
 }
@@ -290,7 +291,7 @@ fn show_menu_at(hwnd: HWND, ctx: &Ctx, x: i32, y: i32) {
             CMD_SETTINGS => {let _=ctx.tx.send(Event::OpenSettings);}
             CMD_ABOUT => about(),
             CMD_EXIT => {
-                // 原版：先摘图标，再结束进程
+                (ctx.before_exit)();
                 remove_icon(hwnd);
                 ExitProcess(0);
             }
@@ -364,7 +365,16 @@ pub struct Tray {
 }
 
 impl Tray {
-    pub fn start(state: State) -> Option<Self> {
+    /// 与托盘菜单「退出」相同：先摘图标再结束进程（用于「立即重启」）。
+    pub fn exit_process(&self) -> ! {
+        unsafe { remove_icon(self.hwnd); ExitProcess(0); }
+    }
+}
+
+impl Tray {
+    pub fn start(state: State) -> Option<Self> {Self::start_with_exit(state,||{})}
+
+    pub(crate) fn start_with_exit(state: State,before_exit:impl Fn()+Send+'static) -> Option<Self> {
         let shared = Arc::new(Mutex::new(state));
         let (event_tx, event_rx) = channel();
         let (ready_tx, ready_rx) = channel();
@@ -416,6 +426,7 @@ impl Tray {
                     return;
                 };
                 let ctx = Box::new(Ctx {
+                    before_exit:Box::new(before_exit),
                     tx: event_tx,
                     state: thread_state,
                     taskbar_msg: RegisterWindowMessageW(w!("TaskbarCreated")),
@@ -491,6 +502,14 @@ impl Drop for Tray {
             let _ = PostMessageW(self.hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
         }
     }
+}
+
+/// 健康提醒独立播放，托盘气泡被 Windows 隐藏时也能听到。
+pub fn play_health_sound() {
+    use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT, SND_NOSTOP};
+    // 异步播放期间 Windows 仍会读取这段内嵌的 WAV。
+    let wav = include_bytes!("../assets/health-reminder.wav");
+    unsafe { let _ = PlaySoundW(PCWSTR(wav.as_ptr().cast()), None, SND_MEMORY | SND_ASYNC | SND_NODEFAULT | SND_NOSTOP); }
 }
 
 /// 单实例：已有岛仔实例时返回 false。

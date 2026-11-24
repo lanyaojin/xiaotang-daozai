@@ -2,6 +2,12 @@
 use crate::{app::{App,Cmd,CALENDAR_PAGE},local_calendar::{self,Draft},paint::{self,Card,H},theme::{self,W}};
 use eframe::egui::{self,Color32};
 
+fn fallback_ics_uid(event:&crate::mail::Meeting)->String{
+    let key=format!("t{}|{}",event.start,event.title.trim());
+    let hash=key.bytes().fold(1469598103934665603u64,|hash,byte|(hash^byte as u64).wrapping_mul(1099511628211));
+    format!("ics-missing-{hash:016x}-{}",event.start)
+}
+
 impl App {
     pub(crate) fn open_calendar_editor(&mut self,uid:Option<&str>){
         let draft=uid.and_then(|uid|self.calendar.local.iter().find(|entry|entry.event.uid==uid)).map(Draft::edit)
@@ -32,18 +38,22 @@ impl App {
         let (lo,hi)=(now-chrono::Duration::days(30),now+chrono::Duration::days(366));
         let mut entries=self.calendar.local.clone();
         let mut known:std::collections::HashSet<_>=entries.iter().map(|entry|entry.event.uid.clone()).collect();
-        let (mut added,mut skipped,mut errors)=(0usize,0usize,Vec::new());
+        // 兼容旧版本对缺少 UID 的日程生成的标识，重新导入时保留已有本机记录。
+        for entry in &entries{if entry.event.uid==format!("ics--{}",entry.event.start){known.insert(fallback_ics_uid(&entry.event));}}
+        let (mut added,mut duplicates,mut capacity,mut errors)=(0usize,0usize,0usize,Vec::new());
+        let mut report=crate::calendar::ReadReport::default();
         for (name,text) in files {
-            match crate::calendar::events_from_ics(text,lo,hi) {
-                Ok(events)=>for mut event in events {
-                    if entries.len()>=5000 {skipped+=1;continue;}
-                    event.uid=format!("ics-{}-{}",event.uid,event.start);
-                    if !known.insert(event.uid.clone()){skipped+=1;continue;}
+            match crate::calendar::inspect_ics(text,lo,hi) {
+                Ok(parsed)=>{report.merge(parsed.report);for mut event in parsed.events {
+                    event.uid=if event.uid.is_empty(){fallback_ics_uid(&event)}else{format!("ics-{}-{}",event.uid,event.start)};
+                    if known.contains(&event.uid){duplicates+=1;continue;}
+                    if entries.len()>=5000 {capacity+=1;continue;}
+                    known.insert(event.uid.clone());
                     let end=event.end.filter(|end|*end>event.start).unwrap_or(event.start+if event.all_day{86400}else{3600});
                     event.end=Some(end);
                     let reminder=(!event.all_day).then_some(15);
                     entries.push(local_calendar::Entry{event,reminder});added+=1;
-                },
+                }},
                 Err(error)=>errors.push(format!("{name}：{error}")),
             }
         }
@@ -51,9 +61,14 @@ impl App {
             if let Err(error)=local_calendar::save(&entries){return error;}
             self.calendar.local=entries;
         }
-        let mut note=if added>0{format!("已导入 {added} 个日程")}else if errors.is_empty(){"文件里没有可导入的日程（只导入过去 30 天到未来一年）".into()}else{String::new()};
-        if skipped>0{note.push_str(&format!("，{skipped} 个已存在已跳过"));}
+        let mut note=if added>0{format!("已导入 {added} 个日程")}else{"没有新增日程".into()};
+        if duplicates>0{note.push_str(&format!("；{duplicates} 个已存在已跳过"));}
+        if capacity>0{note.push_str(&format!("；已达到 5000 个本机日程上限，{capacity} 个未导入"));}
+        if report.outside>0{note.push_str(&format!("；{} 个超出导入范围（过去 30 天至未来一年）",report.outside));}
+        if report.cancelled>0{note.push_str(&format!("；{} 个已取消日程未导入",report.cancelled));}
+        let warning=report.warning();if !warning.is_empty(){note.push('；');note.push_str(&warning);}
         if !errors.is_empty(){if !note.is_empty(){note.push('；');}note.push_str(&errors.join("；"));}
+        if !cfg!(test){crate::resources::append_log(&crate::model::config_dir().join("diagnostics"),"calendar.log",&format!("{} source=ics files={} received={} imported={added} duplicates={duplicates} capacity={capacity} outside={} invalid={} unsupported={} file_errors={} limited={}",chrono::Utc::now().timestamp(),files.len(),report.received,report.outside,report.invalid,report.unsupported,errors.len(),report.limited));}
         self.calendar.import_note=note.clone();
         note
     }

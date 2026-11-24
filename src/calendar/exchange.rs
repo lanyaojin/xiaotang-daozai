@@ -97,7 +97,7 @@ fn endpoint(cfg: &Config) -> Result<url::Url, Failure> {
 /// 一次同步内的连接状态：服务器要求时完成设备策略握手，之后的请求带上策略标识。
 struct Session<'a> { agent: ureq::Agent, cfg: &'a Config, password: &'a str, policy: Option<String>, provisioned: bool }
 impl<'a> Session<'a> {
-    fn new(cfg: &'a Config, password: &'a str) -> Self { Self { agent: super::agent(), cfg, password, policy: None, provisioned: false } }
+    fn new(cfg: &'a Config, password: &'a str) -> Result<Self, Failure> { Ok(Self { agent: super::agent()?, cfg, password, policy: None, provisioned: false }) }
     /// 发送命令；遇到 449 或 142–144 时先握手再重试一次。
     fn send(&mut self, name: &str, root: &Node) -> Result<Node, Failure> {
         match self.raw(name, root) {
@@ -150,11 +150,11 @@ fn command(agent: &ureq::Agent, cfg: &Config, password: &str, name: &str, root: 
     if let Some(key) = policy { request = request.set("X-MS-PolicyKey", key); }
     let response = request.send_bytes(&encode(root)).map_err(|e| match e {
             ureq::Error::Status(code, _) => Failure::status(cfg.provider, code),
-            _ => Failure::transport("Exchange"),
+            error => Failure::transport(&error),
         })?;
     if response.status() != 200 { return Err(Failure::status(cfg.provider, response.status())); }
     let mut bytes = Vec::new();
-    response.into_reader().take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes).map_err(|_| Failure::transport("Exchange"))?;
+    response.into_reader().take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes).map_err(|error| Failure::transport(&error))?;
     if bytes.len() > 16 * 1024 * 1024 { return Err(Failure::text(format!("{}单次返回的日程过多，无法完整同步", cfg.provider.label()))); }
     decode(&bytes)
 }
@@ -175,7 +175,7 @@ fn sync_request(id: &str, key: &str) -> Node {
 }
 
 /// FolderSync 返回的一个文件夹。
-struct Folder { id: String, parent: String, kind: String, name: String }
+struct Folder { id: String, parent: String, kind: String }
 
 /// 默认日历（8）、新建日历（13）一定同步；挂在日历下面的通用（1）或未知类型（18）子文件夹也是日历
 /// （共享、订阅日历常这样组织）。邮件、联系人、任务等文件夹一律不碰，不下载邮件内容。
@@ -223,50 +223,44 @@ fn sync_folder(session: &mut Session, id: &str, label: &str) -> Result<std::coll
 
 pub(super) fn fetch(cfg: &Config, password: &str, lo: DateTime<Utc>, hi: DateTime<Utc>) -> Result<Fetched, Failure> {
     let label = cfg.provider.label();
-    let mut session = Session::new(cfg, password);
+    let mut session = Session::new(cfg, password)?;
     let folders = session.send("FolderSync", &node(FOLDER, 0x16, "", vec![node(FOLDER, 0x12, "0", vec![])]))?;
     check_status(&folders, FOLDER, 0x0c, label)?;
     let changes = folders.child(FOLDER, 0x0e).ok_or_else(invalid)?;
     let all: Vec<Folder> = changes.children.iter().filter(|n| n.page == FOLDER && n.tag == 0x0f).map(|n| Folder {
         id: n.text(FOLDER, 8).to_string(), parent: n.text(FOLDER, 9).to_string(),
-        kind: n.text(FOLDER, 0x0a).to_string(), name: n.text(FOLDER, 7).to_string(),
+        kind: n.text(FOLDER, 0x0a).to_string(),
     }).collect();
     let mut events = Vec::new();
-    let (mut calendars, mut synced, mut skipped) = (0, 0, 0usize);
+    let mut synced=0;
     let mut first_error = None;
-    let mut report = Vec::new();
+    let mut report=super::ReadReport::default();
     for folder in &all {
-        let name: String = folder.name.chars().take(20).collect();
-        if folder.id.is_empty() || !is_calendar(folder, &all) { report.push(format!("{name}[类型{} 跳过]", folder.kind)); continue; }
-        calendars += 1;
+        if folder.id.is_empty() || !is_calendar(folder, &all) {continue;}
+        report.calendars+=1;
         // 单个日历读取失败（权限、只读共享等）不影响其他日历；全部失败才报错。
         let items = match sync_folder(&mut session, &folder.id, label) {
             Ok(items) => items,
-            Err(error) => { report.push(format!("{name}[类型{} 失败:{}]", folder.kind, error.message)); first_error.get_or_insert(error); continue; }
+            Err(error) => {report.failed+=1;report.status=report.status.or(error.status);report.problem(error.message.clone());first_error.get_or_insert(error);continue;}
         };
         let mut ics = String::from("BEGIN:VCALENDAR\nVERSION:2.0\n");
         for (server_id, item) in &items {
             // 个别日程的重复规则暂不支持时只跳过这一条，不拖垮整个日历。
-            match event_ics(item, &format!("{}:{}:{server_id}", cfg.provider.key(), folder.id)) { Ok(event) => ics.push_str(&event), Err(_) => skipped += 1 }
+            match event_ics(item, &format!("{}:{}:{server_id}", cfg.provider.key(), folder.id)) {
+                Ok(event)=>ics.push_str(&event),Err(_)=>{report.received+=1;report.invalid+=1;report.problem("部分 Exchange 日程格式暂无法解析");}
+            }
         }
         ics.push_str("END:VCALENDAR");
         let xml = format!("<calendar-data>{}</calendar-data>", ics.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;"));
-        match super::events_in_range(&xml, lo, hi) {
-            Ok(found) => { report.push(format!("{name}[类型{} 同步{}条]", folder.kind, items.len())); synced += 1; events.extend(found); }
-            Err(error) => { report.push(format!("{name}[类型{} 失败:{}]", folder.kind, error.message)); first_error.get_or_insert(error); }
-        }
+        let parsed=super::parse_events_in_range(&xml,lo,hi);synced+=1;events.extend(parsed.events);report.merge(parsed.report);
     }
-    // 本机诊断：服务器返回了哪些文件夹、类型、是否同步及条数，不记录日程内容和密码。
-    let line = format!("{} {label} 文件夹{}个：{}{}\n", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
-        all.len(), report.iter().take(40).cloned().collect::<Vec<_>>().join(" "), if skipped > 0 { format!(" 跳过无法解析的日程{skipped}条") } else { String::new() });
-    // 测试用模拟服务器时不写，免得把模拟数据混进用户的真实诊断日志。
-    if !cfg!(test) { crate::resources::append_log(&crate::model::config_dir().join("diagnostics"), "calendar.log", &line); }
-    if calendars == 0 { return Err(Failure::text(if cfg.provider == Provider::WeCom {"企业微信未返回可同步的日历，请确认已开启日程同步".to_string()}else{format!("{label}账号下没有可同步的日历")})); }
-    if synced == 0 { return Err(first_error.unwrap_or_else(invalid)); }
+    if report.calendars == 0 { return Err(Failure::text(if cfg.provider == Provider::WeCom {"企业微信未返回可同步的日历，请确认已开启日程同步".to_string()}else{format!("{label}账号下没有可同步的日历")})); }
+    if synced == 0 { return Err(first_error.unwrap_or_else(invalid).with_report(report)); }
+    if events.is_empty() && report.invalid>0{return Err(Failure::text(report.warning()).with_report(report));}
     events.sort_by_key(|m| m.start);
     let mut seen = std::collections::HashSet::new();
     events.retain(|m| seen.insert(super::dedupe_key(m)));
-    Ok(Fetched { href: endpoint(cfg)?.to_string(), events })
+    Ok(Fetched { href: endpoint(cfg)?.to_string(), events, report })
 }
 
 fn date(value: &str) -> Result<DateTime<Utc>, Failure> {
@@ -363,7 +357,7 @@ mod tests {
     #[ignore="只读检查已连接企业微信返回的文件夹类型及日程数量，不输出凭据或正文"]
     fn live_wecom_folder_diagnosis(){
         let cfg=super::super::load_configs().into_iter().find(|c|c.provider==Provider::WeCom).expect("需要已连接的企业微信");
-        let password=super::super::secrets::load(&cfg).unwrap();let agent=super::super::agent();
+        let password=super::super::secrets::load(&cfg).unwrap();let agent=super::super::agent().unwrap();
         let folders=command(&agent,&cfg,&password,"FolderSync",&node(FOLDER,0x16,"",vec![node(FOLDER,0x12,"0",vec![])]),None).unwrap();
         check_status(&folders,FOLDER,0x0c,"企业微信").unwrap();
         for (i,folder) in folders.child(FOLDER,0x0e).unwrap().children.iter().enumerate(){

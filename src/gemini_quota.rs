@@ -2,13 +2,16 @@
 //! 浏览器连接只在用户点击时读取会话；会话由 Windows DPAPI 加密保存。
 use super::{Account,Snapshot,Window};
 use serde_json::{json,Value};
-use std::{fs,io::Read,path::PathBuf,sync::mpsc,time::Duration};
+use std::{fs,io::Read,path::PathBuf,sync::{mpsc,Arc,atomic::{AtomicBool,Ordering}}};
+
+#[cfg(windows)]
+#[path="gemini_browser.rs"]
+mod browser;
 
 const ENDPOINT:&str="https://gemini.google.com/_/BardChatUi/graphql/schemas/GEMINI_WEB_GRAPHQL/executeQuery";
 const SIGNATURE:&str="2/dWbCvkVB0X16r9NPnxifeOAAqdCqMf0xeWvau9yPy7g=";
 const LOGIN_ERROR:&str="Gemini 登录已失效，请重新连接浏览器账号";
 const PARSE_ERROR:&str="Gemini 额度接口已变化，暂时无法读取";
-const EMAIL_SCRIPT:&str=r#"JSON.stringify({email:(document.querySelector('a[aria-label*="@"]')?.getAttribute('aria-label')||'').match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0]||''})"#;
 
 pub fn parse(value:&Value)->Result<Snapshot,String>{
     let data=value.as_array().ok_or(PARSE_ERROR)?.iter().filter_map(|v|v.get("data")).find(|d|d.get("viewer").is_some()).ok_or(PARSE_ERROR)?;
@@ -18,10 +21,10 @@ pub fn parse(value:&Value)->Result<Snapshot,String>{
     let windows=[("GXU_FIVE_HOURLY",18000,"5 小时"),("GXU_WEEKLY",604800,"本周")].into_iter().filter_map(|(kind,seconds,label)|{
         let pool=pools.iter().find(|p|p["poolType"]==kind)?;
         let used=pool["percentageUsed"].as_f64().filter(|n|n.is_finite() && *n>=0.0)?;
-        Some(Window{label:label.into(),seconds:Some(seconds),remaining:(100.0-used*100.0).clamp(0.0,100.0) as f32,reset:super::reset(&pool["gxu"]["windowRefreshesAt"])})
+        Some(Window{label:label.into(),seconds:Some(seconds),remaining:(100.0-used*100.0).clamp(0.0,100.0) as f32,reset:super::reset(&pool["gxu"]["windowRefreshesAt"]),amount:None})
     }).collect::<Vec<_>>();
     if windows.is_empty(){return Err("此 Google 账号暂未提供 Gemini 订阅额度".into());}
-    Ok(Snapshot{credits:None,wallet:None,plan:if usage["subscriptionTier"]=="TIER1"{"AI Pro"}else{""}.into(),windows,extra:vec![],at:chrono::Utc::now().timestamp()})
+    Ok(Snapshot{kiro:None,relay:None,credits:None,wallet:None,plan:if usage["subscriptionTier"]=="TIER1"{"AI Pro"}else{""}.into(),windows,extra:vec![],at:chrono::Utc::now().timestamp()})
 }
 fn decode(raw:&str)->Result<Snapshot,String>{
     let raw=raw.trim_start();let raw=raw.strip_prefix(")]}'").unwrap_or(raw).trim_start();
@@ -98,51 +101,39 @@ fn load(account:&Account)->Result<Session,String>{
     Ok(Session{email,cookie:cookie(value["cookie"].as_str().ok_or(LOGIN_ERROR)?)?})
 }
 pub fn forget(account:&Account){if let Some(path)=account.slot.as_deref().and_then(|s|session_path(s).ok()){let _=fs::remove_file(path);}}
+pub fn address(account:&Account)->Option<String>{load(account).ok().map(|s|s.email)}
 pub fn fetch(agent:&ureq::Agent,account:&Account)->Result<Snapshot,(String,u64)>{
     let session=load(account).map_err(|e|(e,0))?;request(agent,&request_url(&session.email),&session)
 }
-pub struct Connected {pub slot:String,pub label:String,pub snapshot:Snapshot}
-pub struct Connect {rx:mpsc::Receiver<Result<Connected,String>>}
+pub struct Connected {pub slot:String,pub label:String,pub snapshot:Snapshot,session:Session}
+impl Connected {pub fn finish(self)->Result<Self,String>{save(&self.session)?;Ok(self)}}
+pub struct Connect {rx:mpsc::Receiver<Result<Connected,String>>,cancel:Arc<AtomicBool>}
 impl Connect {
     pub fn start(alias:String,address:String,header:Option<String>,expected:Option<String>)->Self{
-        let(tx,rx)=mpsc::channel();std::thread::spawn(move||{let result=(||{
-            let session=if let Some(header)=header{Session{email:email(&address)?,cookie:cookie(&header)?}}else{browser_session(&address)?};
+        let(tx,rx)=mpsc::channel();let cancel=Arc::new(AtomicBool::new(false));let stopped=cancel.clone();
+        std::thread::spawn(move||{let result=(||{
+            let session=if let Some(header)=header{Session{email:email(&address)?,cookie:cookie(&header)?}}else{
+                #[cfg(windows)]{browser::login(&address,&stopped)?}
+                #[cfg(not(windows))]{return Err("Chrome 原生连接暂仅支持 Windows，可使用手动 Cookie 连接".into());}
+            };
+            if stopped.load(Ordering::Relaxed){return Err("已取消 Gemini 连接".into());}
             if expected.as_deref().is_some_and(|s|s!=slot(&session.email)){return Err("当前浏览器是另一个 Google 账号，请切回原账号后重新连接".into());}
             let snapshot=request(&super::http_agent(),&request_url(&session.email),&session).map_err(|e|e.0)?;
-            let slot=save(&session)?;let label=if alias.trim().is_empty(){format!("Gemini · {}",session.email)}else{alias.trim().into()};
-            Ok(Connected{slot,label,snapshot})
-        })();let _=tx.send(result);});Self{rx}
+            if stopped.load(Ordering::Relaxed){return Err("已取消 Gemini 连接".into());}
+            let slot=slot(&session.email);let label=if alias.trim().is_empty(){format!("Gemini · {}",session.email)}else{alias.trim().into()};
+            Ok(Connected{slot,label,snapshot,session})
+        })();let _=tx.send(result);});Self{rx,cancel}
     }
     pub fn poll(&self)->Option<Result<Connected,String>>{self.rx.try_recv().ok()}
+    #[cfg(test)]
+    pub(crate) fn pending()->(Self,mpsc::Sender<Result<Connected,String>>){let(tx,rx)=mpsc::channel();(Self{rx,cancel:Arc::new(AtomicBool::new(false))},tx)}
 }
-fn bridge(agent:&ureq::Agent,action:&str,args:Value)->Result<Value,String>{
-    let body=json!({"action":action,"args":args,"session":"daozai-gemini"});
-    let response=agent.post("http://127.0.0.1:10086/command").set("Content-Type","application/json").send_string(&body.to_string()).map_err(|_|"未连接 Kimi 浏览器扩展；可先连接扩展，或使用下方 Cookie 连接")?;
-    let mut raw=String::new();response.into_reader().take(2*1024*1024).read_to_string(&mut raw).map_err(|_|"无法读取浏览器会话")?;
-    let value:Value=serde_json::from_str(&raw).map_err(|_|"浏览器扩展返回无效数据")?;
-    if value["ok"]!=true{return Err("无法读取 Gemini 标签页，请检查浏览器扩展连接".into());}
-    value.get("data").cloned().ok_or_else(||"无法读取浏览器会话".into())
-}
-fn browser_session(address:&str)->Result<Session,String>{
-    let agent=ureq::AgentBuilder::new().timeout(Duration::from_secs(12)).redirects(0).build();
-    let response=bridge(&agent,"list_browser_tabs",json!({}))?;
-    let mut tabs=response["tabs"].as_array().ok_or("无法读取浏览器标签页")?.iter().filter(|t|t["url"].as_str().and_then(|s|url::Url::parse(s).ok()).is_some_and(|u|u.scheme()=="https" && u.host_str()==Some("gemini.google.com"))).collect::<Vec<_>>();
-    if tabs.is_empty(){return Err("请先在浏览器打开 gemini.google.com/usage 并登录，再连接当前浏览器".into());}
-    tabs.sort_by_key(|t|!t["active"].as_bool().unwrap_or(false));
-    let target=if address.trim().is_empty(){None}else{Some(email(address)?)};
-    if tabs.len()>1 && target.is_none() && tabs[0]["active"]!=true{return Err("有多个 Gemini 标签页，请激活要连接的标签页，或填写 Google 邮箱".into());}
-    for tab in tabs{
-        bridge(&agent,"attach_tab",json!({"tabId":tab["tabId"]}))?;
-        let result=bridge(&agent,"evaluate",json!({"code":EMAIL_SCRIPT}))?;
-        let identity:Value=serde_json::from_str(result["value"].as_str().unwrap_or_default()).map_err(|_|"无法识别 Gemini 账号，请打开用量页面后重试")?;
-        let current=email(identity["email"].as_str().unwrap_or_default()).map_err(|_|"请在 Gemini 用量页面登录 Google 账号后重试")?;
-        if target.as_ref().is_some_and(|target|*target!=current){continue;}
-        let result=bridge(&agent,"cdp",json!({"method":"Network.getCookies","params":{"urls":["https://gemini.google.com/"]}}))?;
-        let cookies=result["cookies"].as_array().ok_or("无法读取 Gemini 登录会话")?;
-        let header=cookies.iter().filter(|c|matches!(c["domain"].as_str(),Some(".google.com"|"google.com"|".gemini.google.com"|"gemini.google.com"))).filter_map(|c|Some(format!("{}={}",c["name"].as_str()?,c["value"].as_str()?))).collect::<Vec<_>>().join("; ");
-        return Ok(Session{email:current,cookie:cookie(&header)?});
-    }
-    Err("没有找到这个 Google 账号的 Gemini 标签页，请先打开该账号的用量页面".into())
+impl Drop for Connect {fn drop(&mut self){self.cancel.store(true,Ordering::Relaxed);}}
+
+#[cfg(test)]
+pub(crate) fn simulated_connected()->Connected{
+    let session=Session{email:"synthetic@example.com".into(),cookie:"SID=synthetic-only".into()};
+    Connected{slot:slot(&session.email),label:"Gemini 测试".into(),snapshot:Snapshot::default(),session}
 }
 
 #[cfg(test)]
@@ -161,16 +152,36 @@ mod tests {
         let task=std::thread::spawn(move||{let(mut stream,_)=server.accept().unwrap();let mut bytes=[0u8;4096];let n=stream.read(&mut bytes).unwrap();let raw=String::from_utf8_lossy(&bytes[..n]);assert!(raw.starts_with("GET /quota HTTP/1.1"));assert!(raw.to_ascii_lowercase().contains("cookie: sid=synthetic"));use std::io::Write;stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 14\r\nConnection: close\r\n\r\nprivate-secret").unwrap();});
         let session=Session{email:"synthetic@example.com".into(),cookie:"SID=synthetic".into()};let error=request(&ureq::AgentBuilder::new().redirects(0).build(),&url,&session).unwrap_err();assert!(error.0.contains("重新连接"));assert!(!error.0.contains("private-secret"));task.join().unwrap();
     }
-    #[test] #[ignore="刷新已绑定的 Gemini 浏览器登录并安全保存"]
-    fn gemini_browser_reconnect_local(){
-        let config=super::super::Config::load();
-        let a=config.accounts.iter().find(|a|a.enabled && a.provider==super::super::Provider::Gemini).unwrap();
-        let current=load(a).unwrap();
-        let session=browser_session(&current.email).unwrap();
-        let snapshot=request(&super::super::http_agent(),&request_url(&session.email),&session).unwrap();
-        assert!(!snapshot.windows.is_empty());assert_eq!(a.slot.as_ref(),Some(&slot(&session.email)));save(&session).unwrap();
+    #[test]
+    #[ignore="按需只读验证已有 Gemini 加密会话，不更新配置"]
+    fn gemini_saved_session_live_read_only(){
+        let _g=crate::ui_tests::ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+        let config=super::super::Config::load();let a=config.accounts.iter().find(|a|a.enabled&&a.provider==super::super::Provider::Gemini).expect("需要已有 Gemini 账号");
+        let snapshot=fetch(&super::super::http_agent(),a).unwrap();assert!(!snapshot.windows.is_empty());
+        println!("已有 Gemini 加密会话读取成功，返回 {} 个额度周期",snapshot.windows.len());
     }
-    #[test] #[ignore="按需验证已登录浏览器的真实 Gemini 额度"] fn gemini_browser_live_read_only(){
-        let session=browser_session("").unwrap();let s=request(&super::super::http_agent(),&request_url(&session.email),&session).unwrap();println!("Gemini 真实额度：{} 个周期，剩余 {:?}",s.windows.len(),s.windows.iter().map(|w|w.remaining).collect::<Vec<_>>());assert!(!s.windows.is_empty());
+    #[cfg(windows)] #[test]
+    #[ignore="使用指定隔离目录验证捕获会话，写入隔离账号配置"]
+    fn gemini_captured_session_independent_refresh(){
+        let _g=crate::ui_tests::ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+        assert!(std::env::var_os("DAOZAI_DATA_DIR").is_some(),"真实验证必须指定隔离测试目录");
+        let slot=fs::read_to_string(crate::model::config_dir().join("verified-slot.txt")).unwrap();
+        let mut config=super::super::Config::default();let id=config.connect_gemini(slot,"Gemini 真实验证".into());
+        let account=config.accounts.iter().find(|a|a.id==id).unwrap();let snapshot=fetch(&super::super::http_agent(),account).unwrap();
+        assert_eq!(snapshot.windows.len(),2);config.save_checked().unwrap();
+        println!("浏览器已断开，原生查询成功：{:?}",snapshot.windows.iter().map(|w|(&w.label,w.remaining)).collect::<Vec<_>>());
+    }
+    #[cfg(windows)] #[test]
+    #[ignore="需要本人允许 Chrome 原生连接，仅更新指定隔离目录中的会话"]
+    fn gemini_native_chrome_live_connection(){
+        let _g=crate::ui_tests::ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+        assert!(std::env::var_os("DAOZAI_DATA_DIR").is_some(),"真实验证必须指定隔离测试目录");
+        let config=super::super::Config::load();let account=config.accounts.iter().find(|a|a.provider==super::super::Provider::Gemini).unwrap();
+        let connect=Connect::start(account.alias.clone(),address(account).unwrap(),None,account.slot.clone());
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(315);
+        let result=loop{if let Some(result)=connect.poll(){break result;}assert!(std::time::Instant::now()<deadline,"Chrome 授权等待超时");std::thread::sleep(std::time::Duration::from_millis(50));};
+        let connected=result.unwrap().finish().unwrap();assert_eq!(connected.snapshot.windows.len(),2);
+        assert_eq!(Some(connected.slot),account.slot);assert!(fetch(&super::super::http_agent(),account).is_ok());
+        println!("原生 Rust 授权连接、身份校验、加密保存及独立刷新全部通过");
     }
 }

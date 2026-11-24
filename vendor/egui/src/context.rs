@@ -3602,7 +3602,11 @@ impl Context {
     ///
     /// This lets you affect another viewport, e.g. resizing its window.
     pub fn send_viewport_cmd_to(&self, id: ViewportId, command: ViewportCommand) {
-        self.request_repaint_of(id);
+        // 岛仔：截图拍的是本帧画面（eframe 在本帧绘制时抓取），不需要再请求重绘；
+        // 否则兼容渲染每次读回都会多画两帧。
+        if !(matches!(command, ViewportCommand::Screenshot(_)) && id == self.viewport_id()) {
+            self.request_repaint_of(id);
+        }
 
         if command.requires_parent_repaint() {
             self.request_repaint_of(self.parent_viewport_id());

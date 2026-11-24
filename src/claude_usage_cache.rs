@@ -86,7 +86,7 @@ fn parse_body(raw:&[u8],headers:&[u8],at:i64,now:i64)->Option<Snapshot>{
         let Some(window)=window.as_ref().or_else(||data.limits.iter().find(|w|w.kind.as_deref()==Some(kind)))else{continue;};
         let Some(used)=window.utilization.or(window.used_percentage).or(window.percent).filter(|n|n.is_finite()&&(0.0..=100.0).contains(n))else{continue;};
         let reset=window.resets_at.as_str().and_then(|s|chrono::DateTime::parse_from_rfc3339(s).ok()).map(|t|t.timestamp()).filter(|t|*t>now&&*t>at&&*t<=at+seconds+60);
-        snapshot.windows.push(Window{label:label.into(),seconds:Some(seconds),remaining:(100.0-used) as f32,reset});
+        snapshot.windows.push(Window{label:label.into(),seconds:Some(seconds),remaining:(100.0-used) as f32,reset,amount:None});
     }
     (!snapshot.windows.is_empty()).then_some(snapshot)
 }

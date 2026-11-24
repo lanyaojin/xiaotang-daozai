@@ -13,6 +13,7 @@ use std::collections::HashMap;
 pub(crate) mod fetch;
 
 pub const SERVICE: &str = "Daozai.Mail";
+pub const MICROSOFT_UNSUPPORTED: &str = "Outlook、Hotmail、Live 和 Microsoft 365 云邮箱需要 OAuth 授权，岛仔暂不支持密码直连。";
 
 // ---------------------------------------------------------------- 邮箱类型
 
@@ -24,6 +25,7 @@ pub enum Provider {
     Exmail,
     ICloud,
     Gmail,
+    Microsoft,
     Custom,
 }
 
@@ -34,13 +36,14 @@ impl Default for Provider {
 }
 
 impl Provider {
-    pub const ALL: [Provider; 7] = [
+    pub const ALL: [Provider; 8] = [
         Provider::Qq,
         Provider::Mail163,
         Provider::Mail126,
         Provider::Exmail,
         Provider::ICloud,
         Provider::Gmail,
+        Provider::Microsoft,
         Provider::Custom,
     ];
 
@@ -52,6 +55,7 @@ impl Provider {
             Provider::Exmail => "exmail",
             Provider::ICloud => "icloud",
             Provider::Gmail => "gmail",
+            Provider::Microsoft => "microsoft",
             Provider::Custom => "custom",
         }
     }
@@ -64,6 +68,7 @@ impl Provider {
             Provider::Exmail => "腾讯企业邮",
             Provider::ICloud => "iCloud 邮箱",
             Provider::Gmail => "Gmail",
+            Provider::Microsoft => "Outlook / Hotmail（暂不支持）",
             Provider::Custom => "自定义 IMAP",
         }
     }
@@ -76,6 +81,7 @@ impl Provider {
             Provider::Exmail => "imap.exmail.qq.com",
             Provider::ICloud => "imap.mail.me.com",
             Provider::Gmail => "imap.gmail.com",
+            Provider::Microsoft => "outlook.office365.com",
             Provider::Custom => "",
         }
     }
@@ -92,6 +98,7 @@ impl Provider {
     /// 设置界面的操作指引。
     pub fn hint(self) -> &'static str {
         match self {
+            Provider::Microsoft => MICROSOFT_UNSUPPORTED,
             Provider::Custom => "向学校或单位管理员确认 IMAP 主机、TLS 端口及用户名。仅支持连接即加密的 IMAP over TLS（通常 993）与 LOGIN/应用专用密码。严格校验证书；不支持明文、STARTTLS、OAuth2 或网页登录/SSO。修改服务器或用户名必须重新输入该目标的授权码。",
             Provider::Qq => "1. 登录 QQ 邮箱网页版，点右上角「设置」→ 左侧「账号与安全」。\n2. 在新页面选「安全设置」，向下找到「POP3/IMAP/SMTP/Exchange/CardDAV 服务」；未开启时先按提示开启。\n3. 点「生成授权码」，完成验证后复制到下方。这里填写授权码，不是 QQ 密码或邮箱独立密码。",
             Provider::Mail163 | Provider::Mail126 => "1. 登录对应的网易邮箱网页版，点顶部「设置」→「POP3/SMTP/IMAP」。\n2. 确认「IMAP/SMTP 服务」已开启；首次开启时按提示完成验证。\n3. 在「授权密码管理」中点「新增授权密码」，完成验证后复制到下方。填写客户端授权码，不是邮箱登录密码。",
@@ -109,6 +116,7 @@ impl Provider {
             Provider::Exmail => ("打开腾讯企业邮网页版", "https://exmail.qq.com/"),
             Provider::ICloud => ("打开 Apple 账户", "https://account.apple.com/"),
             Provider::Gmail => ("打开应用专用密码", "https://myaccount.google.com/apppasswords"),
+            Provider::Microsoft => ("打开 Outlook 网页版", "https://outlook.live.com/mail/"),
             Provider::Custom => ("", ""),
         }
     }
@@ -120,6 +128,7 @@ impl Provider {
             "exmail" => Provider::Exmail,
             "icloud" => Provider::ICloud,
             "gmail" => Provider::Gmail,
+            "microsoft" => Provider::Microsoft,
             "custom" => Provider::Custom,
             _ => Provider::Qq,
         }
@@ -142,9 +151,17 @@ pub struct CustomImap { pub host:String, pub port:u16, pub username:String }
 impl Default for CustomImap {fn default()->Self{Self{host:String::new(),port:993,username:String::new()}}}
 impl Account {
     pub fn endpoint(&self)->Result<(String,u16,String),String>{
+        let email=self.email.trim().to_ascii_lowercase();
+        let domain=email.rsplit_once('@').map(|(_,domain)|domain).unwrap_or("");
+        if self.provider==Provider::Microsoft||matches!(domain,"outlook.com"|"hotmail.com"|"live.com"|"msn.com"){
+            return Err(MICROSOFT_UNSUPPORTED.into());
+        }
         if self.provider!=Provider::Custom {return Ok((self.provider.host().into(),self.provider.port(),self.email.clone()));}
         let c=self.custom.as_ref().ok_or("请填写自定义 IMAP 连接配置")?;
         let host=c.host.trim().to_ascii_lowercase();
+        if matches!(host.as_str(),"outlook.office365.com"|"imap-mail.outlook.com"|"outlook.live.com"|"imap.outlook.com"){
+            return Err(MICROSOFT_UNSUPPORTED.into());
+        }
         if host.is_empty() || host.len()>253 || !host.split('.').all(|label|!label.is_empty() && label.len()<=63 && !label.starts_with('-') && !label.ends_with('-') && label.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'-')) {
             return Err("IMAP 主机必须是域名或 IPv4 地址，不要填写网址、端口、路径或账号".into());
         }
@@ -257,6 +274,9 @@ pub struct Item {
     pub received_unix: Option<i64>,
     /// 完整纯文字正文，保留分段，仅保存在内存中。
     pub summary: std::sync::Arc<str>,
+    /// HTML 原文（无 HTML 版本时为空）。排版层据此还原标题、列表、引用等结构；
+    /// `summary` 只作为纯文本邮件的兜底，两者都只在内存中保存。
+    pub html: std::sync::Arc<str>,
     pub links: Vec<Link>,
     /// 会议邀请（来自 .ics / text/calendar），没有就是 `None`。
     pub meeting: Option<Meeting>,
@@ -413,7 +433,7 @@ pub fn parse_message(raw: &[u8]) -> Parsed {
     Parsed { from, subject, text: plain, html, calendar, emphasized }
 }
 
-/// 优先纯文本，HTML 邮件转成文字；保留完整正文与段落。
+/// 优先纯文本；HTML 原文另外保留给阅读界面排版。
 pub fn body_of(parsed:&Parsed)->String {
     let body = if !parsed.text.trim().is_empty() {
         parsed.text.clone()
@@ -690,11 +710,11 @@ pub(crate) mod net {
     }
 
     pub fn connect(account: &Account, password: &str) -> Result<imap::Session<Prefixed<Stream>>, String> {
+        let (host,port,username)=account.endpoint()?;
         let tls = TlsConnector::builder()
             .min_protocol_version(Some(native_tls::Protocol::Tlsv12))
             .build()
             .map_err(|e| format!("TLS 初始化失败：{e}"))?;
-        let (host,port,username)=account.endpoint()?;
         let tcp = TcpStream::connect((host.as_str(), port))
             .map_err(|e| format!("无法连接 {host}：{e}"))?;
         let timeout = Some(Duration::from_secs(20));
@@ -955,6 +975,9 @@ mod service {
     }
 
     fn worker(account: Account, stop: Arc<AtomicBool>, interval: Arc<AtomicU64>, ev: Sender<Event>) {
+        if let Err(error)=account.endpoint(){
+            let _=ev.send(Event::Status{account:account.email,status:Status::Failed(error)});return;
+        }
         let mut last_uid = None;
         let mut last_validity=None;
         let mut failures=0;
@@ -1465,6 +1488,22 @@ pub use service::Service;
 
 #[cfg(test)]
 mod tests {
+
+    /// multipart/alternative 邮件必须同时保留 text/plain 与 text/html 原文，
+    /// 否则排版层只能拿到被压平的纯文本。
+    #[test]
+    fn multipart_message_keeps_html_original(){
+        let raw=b"From: Team <team@example.com>\r\nSubject: Weekly\r\n\
+Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
+--b\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nWeekly  Flat text\r\n\
+--b\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<h1>Weekly</h1><ul><li>Flat text</li></ul>\r\n--b--\r\n";
+        let parsed=super::parse_message(raw);
+        assert!(!parsed.text.trim().is_empty(),"text/plain 仍要保留作摘要与兜底");
+        assert!(parsed.html.contains("<h1>"),"HTML 原文必须保留");
+        let lines=crate::mail_format::lines(&parsed.html,&parsed.text);
+        assert_eq!(lines[0].kind,crate::mail_format::Kind::Title,"真实邮件应走 HTML 排版");
+        assert!(lines.iter().any(|l|l.kind==crate::mail_format::Kind::Bullet));
+    }
     #[test]
     fn quality_cancelled_meetings_are_not_active_events() {
         let event="BEGIN:VEVENT\nUID:cancelled\nDTSTART:20261101T060000Z\nSTATUS:CANCELLED\nEND:VEVENT";
@@ -1536,7 +1575,7 @@ mod tests {
 
     #[test]
     fn provider_presets_cover_six_kinds() {
-        assert_eq!(Provider::ALL.len(), 7);
+        assert_eq!(Provider::ALL.len(), 8);
         assert_eq!(Provider::parse("gmail"), Provider::Gmail);
         assert_eq!(Provider::Gmail.host(), "imap.gmail.com");
         assert_eq!(Provider::Gmail.port(), 993);
@@ -1660,6 +1699,20 @@ END:VCALENDAR\r\n";
 
 #[cfg(test)]
 mod custom_endpoint_tests {
+ #[test] fn microsoft_cloud_accounts_report_unsupported_before_connecting(){
+  let a=Account{email:"test@hotmail.com".into(),provider:Provider::Microsoft,custom:None,enabled:true};
+  let error=a.endpoint().expect_err("尚未支持的微软邮箱不能发起连接");
+  assert!(error.contains("OAuth")&&error.contains("暂不支持"));
+  assert!(Provider::Microsoft.label().contains("暂不支持"));
+  for host in ["outlook.office365.com"," IMAP-MAIL.OUTLOOK.COM ","outlook.live.com","imap.outlook.com"]{
+   let b=Account{email:"student@example.edu".into(),provider:Provider::Custom,custom:Some(CustomImap{host:host.into(),port:993,username:String::new()}),..a.clone()};
+   assert_eq!(b.endpoint().unwrap_err(),error,"微软云主机应显示同一提示");
+  }
+  for email in ["user@outlook.com","user@hotmail.com","user@live.com"," USER@OUTLOOK.COM "]{
+   let b=Account{email:email.into(),provider:Provider::Qq,custom:None,enabled:true};
+   assert_eq!(b.endpoint().unwrap_err(),error,"误选服务商也不能引导用户尝试密码");
+  }
+ }
  use super::*;
  fn account()->Account{Account{email:"student@example.edu".into(),provider:Provider::Custom,enabled:true,custom:Some(CustomImap{host:"imap.example.edu".into(),port:993,username:"student-id".into()})}}
  #[test] fn custom_requires_tls_hostname_and_clean_identity(){

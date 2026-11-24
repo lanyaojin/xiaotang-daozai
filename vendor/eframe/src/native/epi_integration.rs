@@ -183,6 +183,8 @@ impl EpiIntegration {
         #[cfg(feature = "wgpu")] wgpu_render_state: Option<egui_wgpu::RenderState>,
     ) -> Self {
         let frame = epi::Frame {
+            #[cfg(feature = "wgpu")]
+            interactive_frame_start: None,
             info: epi::IntegrationInfo { cpu_usage: None },
             storage,
             #[cfg(feature = "glow")]

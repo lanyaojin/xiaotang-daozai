@@ -1,40 +1,57 @@
-//! 只接收微信任务栏提醒；复用主窗口消息循环，不读取聊天内容。
+//! 任务栏提醒共用主窗口消息循环；按账号未读状态合并，不读取聊天内容。
 use std::{cell::RefCell, path::PathBuf, time::{Duration, Instant}};
-use windows::{core::{w, PCWSTR, PWSTR}, Win32::{
+use windows::{core::{w, PCWSTR}, Win32::{
     Foundation::{CloseHandle, HWND, LPARAM, LRESULT, WPARAM},
-    System::{Registry::{RegGetValueW, HKEY, HKEY_CLASSES_ROOT, HKEY_CURRENT_USER, RRF_RT_REG_SZ},
-        Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION}},
+    System::Registry::{HKEY_CLASSES_ROOT, HKEY_CURRENT_USER},
     UI::{Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass}, WindowsAndMessaging::*},
 }};
+
+use crate::messenger::{OpenError,Unread};
+use crate::messenger::windows::*;
+
+pub(crate) const ADAPTER:NativeAdapter=NativeAdapter{
+    paths:installed_paths,main_frame:wechat_main_frame,accounts:None,ready:|_|true,strict_window:false,open:open_wechat,taskbar:Some(start_taskbar),
+};
+fn wechat_main_frame(class:&str,style:u32,extended:u32)->bool{
+    (class=="WeChatMainWndForPC" || class.starts_with("Qt") && class.ends_with("QWindowIcon")) && frame_style(class,style,extended)
+}
+fn start_taskbar(ctx:eframe::egui::Context)->Result<Box<dyn TaskbarSource>,String>{Ok(Box::new(Listener::new(ctx)?))}
+impl TaskbarSource for Listener {
+    fn registered(&self)->bool{Listener::registered(self)}
+    fn take(&self)->Vec<(u32,isize)>{Listener::take(self)}
+    fn forget(&self,pid:u32){Listener::forget(self,pid);}
+}
+fn open_wechat(unread:Unread,paths:&[String],allow_tray:bool)->Result<(),OpenError>{
+    let window=HWND(unread.window as *mut _);
+    unsafe{
+        let target=if unread.pid==0{None}
+            else if window_pid(window)==unread.pid && usable_main_frame(window,unread.source) && matches(window,paths){Some(window)}
+            else{account_main_window(unread.pid,unread.source,paths)};
+        if let Some(target)=target{
+            wake_step(format!("切前台 {}",describe_window(target)));
+            if IsIconic(target).as_bool(){ShowWindowAsync(target,SW_RESTORE).ok().map_err(|_|{wake_step("还原最小化窗口失败");OpenError::Failed("请从任务栏打开微信".into())})?;}
+            if SetForegroundWindow(target).as_bool(){wake_step("系统已接受");return Ok(());}
+            wake_step("系统拒绝切前台");
+        }else{wake_step("没有该账号可见的微信主窗口");}
+    }
+    if !allow_tray{wake_step("未开启从托盘唤起");return Err(OpenError::Failed("请从任务栏或托盘打开微信".into()));}
+    // 托盘唤起的每一步记在 wechat-tray.log（失败时写入，失败代码 T0–T5 同时出现在唤起结果里）。
+    wake_step("改从托盘唤起");
+    wechat_in_tray(unread).map_err(OpenError::Failed)?;
+    open_wechat_from_tray(unread).map_err(OpenError::Failed)
+}
 
 const SUBCLASS_ID: usize = 0x5745_4348;
 const FLASH: usize = 0x8006;
 
-/// 看过某个账号后切走：这段时间内的闪动算作刚才那次提醒的余波。
-const LEAVE_GRACE: Duration = Duration::from_secs(4);
-
+/// 合并同一窗口的短间隔事件；是否重弹由界面的账号未读状态决定。
 #[derive(Default)]
-struct Burst { last: Option<Instant>, quiet_until: Option<Instant> }
+struct Burst {last:Option<Instant>,window:isize}
 impl Burst {
-    fn attention(&mut self, now: Instant) -> bool {
-        // 刚看完切走：任务栏补闪不算新提醒，但计入这一轮，持续闪动也继续合并。
-        if self.quiet_until.is_some_and(|until| now < until) {self.last=Some(now);return false;}
-        // 连续闪动只提醒一次；停止闪动五秒后，下一轮才算新提醒。
-        self.last.replace(now).is_none_or(|last| now.duration_since(last) >= Duration::from_secs(5))
+    fn attention(&mut self,now:Instant,window:isize)->bool{
+        let changed=self.window!=window;self.window=window;
+        self.last.replace(now).is_none_or(|last|now.duration_since(last)>=Duration::from_secs(5)) || changed
     }
-    /// 用户刚从这个账号的窗口切走。
-    fn left(now: Instant) -> Self { Self{last:Some(now),quiet_until:Some(now+LEAVE_GRACE)} }
-}
-
-fn normalized(path: &str) -> String {
-    path.trim_start_matches(r"\\?\").replace('/', "\\").to_lowercase()
-}
-
-fn registry_string(root:HKEY,key:PCWSTR,name:PCWSTR)->Option<String>{
-    let mut data=[0u16;2048];let mut size=(data.len()*2) as u32;
-    unsafe {RegGetValueW(root,key,name,RRF_RT_REG_SZ,None,Some(data.as_mut_ptr().cast()),Some(&mut size))}.ok().ok()?;
-    let length=data.iter().position(|c|*c==0).unwrap_or(data.len());
-    Some(String::from_utf16_lossy(&data[..length]))
 }
 
 // 只提取协议处理程序的路径，绝不执行注册表里的命令或参数。
@@ -60,183 +77,11 @@ fn installed_paths() -> Vec<String> {
     paths
 }
 
-/// 程序文件属性里的公司名（结果按路径缓存，避免每次读文件）。
-fn company_name(path:&str)->String{
-    use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW,GetFileVersionInfoW,VerQueryValueW};
-    static CACHE:std::sync::Mutex<Option<std::collections::HashMap<String,String>>>=std::sync::Mutex::new(None);
-    if let Some(name)=CACHE.lock().ok().and_then(|c|c.as_ref().and_then(|c|c.get(path).cloned())){return name;}
-    let name=unsafe{(||->Option<String>{
-        let wide:Vec<u16>=path.encode_utf16().chain(Some(0)).collect();
-        let size=GetFileVersionInfoSizeW(PCWSTR(wide.as_ptr()),None);
-        if size==0 {return None;}
-        let mut data=vec![0u8;size as usize];
-        GetFileVersionInfoW(PCWSTR(wide.as_ptr()),0,size,data.as_mut_ptr().cast()).ok()?;
-        let mut pointer=std::ptr::null_mut();let mut length=0u32;
-        if !VerQueryValueW(data.as_ptr().cast(),w!("\\VarFileInfo\\Translation"),&mut pointer,&mut length).as_bool() || length<4 {return None;}
-        let translation=*(pointer as *const [u16;2]);
-        let key:Vec<u16>=format!("\\StringFileInfo\\{:04x}{:04x}\\CompanyName",translation[0],translation[1]).encode_utf16().chain(Some(0)).collect();
-        if !VerQueryValueW(data.as_ptr().cast(),PCWSTR(key.as_ptr()),&mut pointer,&mut length).as_bool() || length==0 {return None;}
-        let text=std::slice::from_raw_parts(pointer as *const u16,length as usize);
-        Some(String::from_utf16_lossy(text).trim_end_matches('\0').to_string())
-    })()}.unwrap_or_default();
-    if let Ok(mut cache)=CACHE.lock(){cache.get_or_insert_with(Default::default).insert(path.to_string(),name.clone());}
-    name
-}
-
-/// 路径完全一致；或命中「*文件名」且该程序由腾讯发布。
-fn path_allowed(image:&str,paths:&[String])->bool{
-    if paths.iter().any(|p|p==image){return true;}
-    let file=image.rsplit('\\').next().unwrap_or(image);
-    paths.iter().any(|p|p.strip_prefix('*').is_some_and(|name|name==file)) && company_name(image).to_lowercase().contains("tencent")
-}
-
-unsafe fn matches(hwnd: HWND, paths: &[String]) -> bool {
-    if hwnd.0.is_null(){return false;}
-    let mut pid=0;GetWindowThreadProcessId(hwnd,Some(&mut pid));
-    pid_matches(pid,paths)
-}
-
-unsafe fn pid_matches(pid:u32, paths: &[String]) -> bool {
-    if pid==0 {return false;}
-    let Ok(process)=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,false,pid) else{return false};
-    let mut path=[0u16;32768];let mut length=path.len() as u32;
-    let result=QueryFullProcessImageNameW(process,PROCESS_NAME_WIN32,PWSTR(path.as_mut_ptr()),&mut length);
-    let _=CloseHandle(process);
-    result.is_ok() && path_allowed(&normalized(&String::from_utf16_lossy(&path[..length as usize])),paths)
-}
-
-fn client_paths(source:crate::app::Messenger)->Vec<String>{
-    if source==crate::app::Messenger::Wechat{return installed_paths();}
-    use windows::Win32::System::Registry::HKEY_LOCAL_MACHINE;
-    let mut candidates=Vec::new();
-    for root in [HKEY_CURRENT_USER,HKEY_LOCAL_MACHINE]{
-        for key in [w!("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\QQ"),w!("Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\QQ")]{
-            if let Some(icon)=registry_string(root,key,w!("DisplayIcon")){
-                let exe=icon.rsplit_once(',').filter(|(_,index)|index.trim().parse::<i32>().is_ok()).map_or(icon.as_str(),|(path,_)|path);
-                candidates.push(PathBuf::from(exe.trim().trim_matches('"')));
-            }
-        }
-    }
-    // QQ NT 的协议处理器在版本子目录中，主程序在安装根目录。
-    if let Some(command)=registry_string(HKEY_CLASSES_ROOT,w!("tencent\\shell\\open\\command"),PCWSTR::null()){
-        let helper=command.trim().trim_start_matches('"').split('"').next().unwrap_or("");
-        let helper=std::path::Path::new(helper);
-        if helper.is_absolute() && helper.file_name().is_some_and(|n|n.eq_ignore_ascii_case("timwp.exe")){
-            if let Some(versions)=helper.ancestors().find(|p|p.file_name().is_some_and(|n|n.eq_ignore_ascii_case("versions"))){
-                if let Some(root)=versions.parent(){candidates.push(root.join("QQ.exe"));}
-            }
-        }
-    }
-    let mut paths:Vec<String>=candidates.into_iter().filter(|p|p.is_absolute() && p.file_name().is_some_and(|n|n.eq_ignore_ascii_case("QQ.exe")) && p.is_file())
-        .filter_map(|p|p.canonicalize().ok()).map(|p|normalized(&p.to_string_lossy())).collect();
-    paths.push("*qq.exe".into());
-    paths
-}
-
-fn client_main_frame(source:crate::app::Messenger,class:&str,style:u32,extended:u32)->bool{
-    let known=match source {
-        crate::app::Messenger::Qq=>matches!(class,"Chrome_WidgetWin_1"|"TXGuiFoundation"),
-        crate::app::Messenger::Wechat=>class=="WeChatMainWndForPC" || class.starts_with("Qt") && class.ends_with("QWindowIcon"),
-    };
-    let frame=(WS_SYSMENU|WS_MINIMIZEBOX).0;
-    let resizable_frame=(WS_CAPTION|WS_THICKFRAME|WS_MINIMIZEBOX).0;
-    let custom_frame=class.starts_with("Qt") || class=="Chrome_WidgetWin_1";
-    known && (style & frame==frame || custom_frame && style & resizable_frame==resizable_frame) && extended & (WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE).0==0
-}
-
-fn window_pid(hwnd:HWND)->u32{
-    let mut pid=0;
-    if !hwnd.0.is_null(){unsafe{GetWindowThreadProcessId(hwnd,Some(&mut pid));}}
-    pid
-}
-
-/// 前台是该客户端的主窗口时返回它所在的进程（多开时每个账号一个进程）。
-unsafe fn foreground_main_pid(source:crate::app::Messenger,paths:&[String])->Option<u32>{
-    let hwnd=GetForegroundWindow();
-    if IsIconic(hwnd).as_bool() || !visible_main_frame(hwnd,source) || !matches(hwnd,paths){return None;}
-    Some(window_pid(hwnd))
-}
-
-unsafe fn visible_main_frame(hwnd:HWND,source:crate::app::Messenger)->bool{
-    if !IsWindowVisible(hwnd).as_bool() || GetWindow(hwnd,GW_OWNER).is_ok(){return false;}
-    let mut class=[0u16;128];
-    let n=GetClassNameW(hwnd,&mut class).max(0) as usize;
-    client_main_frame(source,&String::from_utf16_lossy(&class[..n]),GetWindowLongW(hwnd,GWL_STYLE) as u32,GetWindowLongW(hwnd,GWL_EXSTYLE) as u32)
-}
-
-/// 用户真正看得到、像主窗口的窗口：排除被系统隐藏（cloaked）、不在任何显示器上、或小于主窗口的弹窗。
-unsafe fn usable_main_frame(hwnd:HWND,source:crate::app::Messenger)->bool{
-    use windows::Win32::{Foundation::RECT,Graphics::{Dwm::{DwmGetWindowAttribute,DWMWA_CLOAKED},Gdi::{MonitorFromWindow,MONITOR_DEFAULTTONULL}}};
-    if !visible_main_frame(hwnd,source){return false;}
-    let mut cloaked=0u32;
-    if DwmGetWindowAttribute(hwnd,DWMWA_CLOAKED,(&mut cloaked as *mut u32).cast(),4).is_ok() && cloaked!=0 {return false;}
-    if IsIconic(hwnd).as_bool(){return true;}
-    let mut r=RECT::default();
-    GetWindowRect(hwnd,&mut r).is_ok() && r.right-r.left>=300 && r.bottom-r.top>=300 && !MonitorFromWindow(hwnd,MONITOR_DEFAULTTONULL).0.is_null()
-}
-
-/// 进程 → 父进程。用来把闪动的子进程对应回它所属账号的微信主进程。
-fn parent_processes()->std::collections::HashMap<u32,u32>{
-    use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot,Process32FirstW,Process32NextW,PROCESSENTRY32W,TH32CS_SNAPPROCESS};
-    let mut parents=std::collections::HashMap::new();
-    unsafe{
-        let Ok(snapshot)=CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS,0) else {return parents};
-        let mut entry=PROCESSENTRY32W{dwSize:std::mem::size_of::<PROCESSENTRY32W>() as u32,..Default::default()};
-        let mut ok=Process32FirstW(snapshot,&mut entry).is_ok();
-        while ok {parents.insert(entry.th32ProcessID,entry.th32ParentProcessID);ok=Process32NextW(snapshot,&mut entry).is_ok();}
-        let _=CloseHandle(snapshot);
-    }
-    parents
-}
-
-/// 从 `pid` 往上的祖先进程（不含自己），最多 8 层，遇到环或系统进程即止。
-fn ancestors(pid:u32,parents:&std::collections::HashMap<u32,u32>)->Vec<u32>{
-    let mut chain=Vec::new();let mut current=pid;
-    for _ in 0..8 {
-        match parents.get(&current){Some(&parent) if parent!=0 && parent!=current && parent!=pid && !chain.contains(&parent)=>{chain.push(parent);current=parent;},_=>break}
-    }
-    chain
-}
-
-pub fn client_in_foreground(source:crate::app::Messenger)->bool{
-    unsafe{foreground_main_pid(source,&client_paths(source)).is_some()}
-}
-
-/// 当前前台的微信 / QQ 主窗口：来源与账号进程。
-pub fn foreground_client(sources:&[crate::app::Messenger])->Option<(crate::app::Messenger,u32)>{
-    sources.iter().find_map(|&source|unsafe{foreground_main_pid(source,&client_paths(source))}.map(|pid|(source,pid)))
-}
-
-/// 跳到某条未读对应的窗口。
-pub fn open_unread(unread:crate::app::Unread)->Result<(),String>{
-    open_unread_with_paths(unread,&client_paths(unread.source))
-}
-
-fn open_unread_with_paths(unread:crate::app::Unread,paths:&[String])->Result<(),String>{
-    let window=HWND(unread.window as *mut _);
-    if unread.source==crate::app::Messenger::Wechat {
-        // 微信 4 闪动的句柄常是隐藏的 Qt 辅助窗口：从外部显示它会出现白屏、拖死微信。
-        // 只切换到该账号进程里已可见的主窗口；绝不显示隐藏窗口，也不另起 Weixin.exe。
-        unsafe {
-            let target=if unread.pid==0 {None}
-                else if window_pid(window)==unread.pid && usable_main_frame(window,unread.source) && matches(window,paths) {Some(window)}
-                else {account_main_window(unread.pid,unread.source,paths)};
-            if let Some(target)=target {
-                // 异步恢复：微信卡住时也不能拖住岛仔的界面线程。
-                if IsIconic(target).as_bool(){ShowWindowAsync(target,SW_RESTORE).ok().map_err(|_|"请从任务栏打开微信".to_string())?;}
-                if SetForegroundWindow(target).as_bool(){return Ok(());}
-            }
-        }
-        return Err("请从任务栏或托盘打开微信".into());
-    }
-    unsafe{
-        if unread.window!=0 && IsWindow(window).as_bool() && window_pid(window)==unread.pid && matches(window,paths){
-            if IsIconic(window).as_bool(){let _=ShowWindowAsync(window,SW_RESTORE);}
-            else if !IsWindowVisible(window).as_bool(){let _=ShowWindowAsync(window,SW_SHOW);}
-            if SetForegroundWindow(window).as_bool(){return Ok(());}
-        }
-    }
-    open_client(unread.source)
+/// 闪动与前台查看使用同一账号进程口径，兼容主窗口与托盘宿主位于不同进程。
+pub(crate) fn account_pid(pid:u32,paths:&[String])->u32{
+    let owners:std::collections::HashSet<_>=unsafe{tray_hosts(paths)}.into_iter().map(|(pid,_)|pid).collect();
+    if owners.is_empty() || owners.contains(&pid){return pid;}
+    account_tray_pid(pid,&owners.into_iter().collect::<Vec<_>>(),&parent_processes()).unwrap_or(pid)
 }
 
 /// 托盘唤起的诊断：只记步骤、窗口类名、位置和系统版本，不记窗口标题、提示文字或聊天内容。
@@ -259,13 +104,6 @@ impl TrayLog {
     }
 }
 
-fn class_name(hwnd:HWND)->String{
-    let mut class=[0u16;128];
-    let n=unsafe{GetClassNameW(hwnd,&mut class)}.max(0) as usize;
-    String::from_utf16_lossy(&class[..n])
-}
-
-/// 所有微信进程的托盘消息窗口：（进程，窗口）。
 unsafe fn tray_hosts(paths:&[String])->Vec<(u32,HWND)>{
     use windows::Win32::Foundation::BOOL;
     struct Find<'a>{paths:&'a [String],hosts:Vec<(u32,HWND)>}
@@ -284,11 +122,6 @@ struct TrayAccount {
     pid:u32,
     hosts:Vec<(u32,HWND)>,
     icon:Option<(HWND,u32)>,
-}
-
-unsafe fn host_icons(hosts:&[(u32,HWND)],pid:u32)->Vec<(HWND,u32)>{
-    hosts.iter().filter(|(p,_)|*p==pid).flat_map(|&(_,h)|
-        (0..=256).filter(move |id|tray_rect(h,*id).is_some()).map(move |id|(h,id))).collect()
 }
 
 unsafe fn tray_account(pid:u32,paths:&[String],log:&mut TrayLog)->Option<TrayAccount>{
@@ -323,15 +156,6 @@ fn remaining_tray_button(buttons:&[windows::Win32::Foundation::RECT],others:&[Op
     assigned.iter().position(|used|!*used)
 }
 
-/// 闪动进程所属账号的托盘进程：自己 → 最近的祖先 → 唯一的后代。双开时两个账号互不相干，不会串号。
-fn account_tray_pid(pid:u32,hosts:&[u32],parents:&std::collections::HashMap<u32,u32>)->Option<u32>{
-    if pid==0 {return None;}
-    if hosts.contains(&pid){return Some(pid);}
-    if let Some(ancestor)=ancestors(pid,parents).into_iter().find(|a|hosts.contains(a)){return Some(ancestor);}
-    let below:Vec<u32>=hosts.iter().copied().filter(|h|ancestors(*h,parents).contains(&pid)).collect();
-    match below.as_slice(){[one]=>Some(*one),_=>None}
-}
-
 /// 该账号能切换过去的主窗口：先找闪动进程自己，再找它的微信祖先进程。
 unsafe fn account_main_window(pid:u32,source:crate::app::Messenger,paths:&[String])->Option<HWND>{
     if pid==0 {return None;}
@@ -355,12 +179,6 @@ pub fn wechat_in_tray(unread:crate::app::Unread)->Result<(),String>{
         }
     }
     Ok(())
-}
-
-unsafe fn tray_rect(host:HWND,id:u32)->Option<windows::Win32::Foundation::RECT>{
-    use windows::Win32::UI::Shell::{Shell_NotifyIconGetRect,NOTIFYICONIDENTIFIER};
-    let icon=NOTIFYICONIDENTIFIER{cbSize:std::mem::size_of::<NOTIFYICONIDENTIFIER>() as u32,hWnd:host,uID:id,..Default::default()};
-    Shell_NotifyIconGetRect(&icon).ok()
 }
 
 fn rect_center_inside(inner:windows::Win32::Foundation::RECT,outer:windows::Win32::Foundation::RECT)->bool{
@@ -410,6 +228,31 @@ unsafe fn reveal_taskbar(ui:&windows::Win32::UI::Accessibility::IUIAutomation,ta
     wait()
 }
 
+unsafe fn tray_overflow_button(ui:&windows::Win32::UI::Accessibility::IUIAutomation,taskbar:HWND)->Option<windows::Win32::UI::Accessibility::IUIAutomationElement>{
+    use windows::Win32::UI::Accessibility::*;
+    let usable=|item:&IUIAutomationElement|item.CurrentIsEnabled().is_ok_and(|b|b.as_bool())
+        && item.CurrentIsOffscreen().is_ok_and(|b|!b.as_bool())
+        && item.CurrentNativeWindowHandle().map_or(true,|h|h.0.is_null() || IsWindowVisible(h).as_bool())
+        && item.CurrentBoundingRectangle().is_ok_and(|r|r.right>r.left && r.bottom>r.top && r.right-r.left<=200 && r.bottom-r.top<=200)
+        && item.GetCurrentPatternAs::<IUIAutomationInvokePattern>(UIA_InvokePatternId).is_ok();
+    let legacy=FindWindowExW(taskbar,None,w!("TrayNotifyWnd"),PCWSTR::null()).ok()
+        .and_then(|tray|FindWindowExW(tray,None,w!("Button"),PCWSTR::null()).ok())
+        .and_then(|button|ui.ElementFromHandle(button).ok());
+    if let Some(button)=legacy.filter(usable){return Some(button);}
+    let items=ui.ElementFromHandle(taskbar).ok()?.FindAll(TreeScope_Descendants,&ui.CreateTrueCondition().ok()?).ok()?;
+    let mut found=None;
+    for i in 0..items.Length().ok()?{
+        let Ok(item)=items.GetElement(i) else{continue;};
+        if item.CurrentControlType().ok()!=Some(UIA_ButtonControlTypeId)
+            || !item.CurrentName().is_ok_and(|name|matches!(name.to_string().trim().to_ascii_lowercase().as_str(),"显示隐藏的图标"|"顯示隱藏的圖示"|"show hidden icons"))
+            || !usable(&item){continue;}
+        // 多个不同的折叠按钮时不猜，避免打开错误的通知区域。
+        if let Some(previous)=&found{if !ui.CompareElements(previous,&item).ok()?.as_bool(){return None;}}
+        found=Some(item);
+    }
+    found
+}
+
 /// 微信缩在托盘时：通过无障碍接口按下该账号自己的托盘按钮，由微信自己唤起主窗口。
 /// 不移动鼠标、不向微信发送内部消息、不注入、不读取内容；定位不到唯一按钮就放弃。
 /// 兼容新版 Win11 托盘与 Windows 10 / 早期 Win11 的旧式托盘。会阻塞几百毫秒，必须在后台线程调用。
@@ -442,6 +285,7 @@ pub fn open_wechat_from_tray(unread:crate::app::Unread)->Result<(),String>{
             let mut covering=Vec::new();
             for i in 0..count {
                 let Ok(item)=items.GetElement(i) else {continue};
+                if !item.CurrentIsEnabled().is_ok_and(|b|b.as_bool()) || !item.CurrentIsOffscreen().is_ok_and(|b|!b.as_bool()){continue;}
                 let Ok(r)=item.CurrentBoundingRectangle() else {continue};
                 if !rect_center_inside(icon,r) {continue;}
                 if covering.len()<8 {covering.push(describe_element(&item));}
@@ -516,6 +360,7 @@ pub fn open_wechat_from_tray(unread:crate::app::Unread)->Result<(),String>{
                         if !item.CurrentName().is_ok_and(|s|wechat_tray_name(&s.to_string())){continue;}
                         let Ok(r)=item.CurrentBoundingRectangle() else{continue;};
                         if r.right<=r.left || r.bottom<=r.top || r.right-r.left>200 || r.bottom-r.top>200 || item.CurrentIsOffscreen().map_or(true,|b|b.as_bool())
+                            || !item.CurrentIsEnabled().is_ok_and(|b|b.as_bool())
                             || item.GetCurrentPatternAs::<IUIAutomationInvokePattern>(UIA_InvokePatternId).is_err(){continue;}
                         if !buttons.iter().any(|(_,old):&(RECT,IUIAutomationElement)|ui.CompareElements(old,&item).is_ok_and(|same|same.as_bool())){buttons.push((r,item));}
                     }
@@ -531,14 +376,7 @@ pub fn open_wechat_from_tray(unread:crate::app::Unread)->Result<(),String>{
             let mut target=by_exclusion();
             let mut opened=None;
             if target.is_none() && overflow_open().is_none(){
-                let tray=FindWindowExW(taskbar,None,w!("TrayNotifyWnd"),PCWSTR::null()).ok();
-                let legacy=tray.and_then(|h|FindWindowExW(h,None,w!("Button"),PCWSTR::null()).ok()).and_then(|h|ui.ElementFromHandle(h).ok());
-                let chevron=legacy.or_else(||{
-                    let items=ui.ElementFromHandle(taskbar).ok()?.FindAll(TreeScope_Descendants,&all).ok()?;
-                    (0..items.Length().ok()?).filter_map(|i|items.GetElement(i).ok()).find(|item|
-                        item.CurrentClassName().is_ok_and(|c|c.to_string()=="SystemTray.NormalButton")
-                        && item.CurrentName().is_ok_and(|n|matches!(n.to_string().to_lowercase().as_str(),"显示隐藏的图标"|"顯示隱藏的圖示"|"show hidden icons")))
-                });
+                let chevron=tray_overflow_button(&ui,taskbar);
                 if let Some(button)=chevron.filter(|b|invoke(b)){
                     opened=Some(button);
                     for _ in 0..12{
@@ -579,11 +417,9 @@ pub fn open_wechat_from_tray(unread:crate::app::Unread)->Result<(),String>{
             log.step("命中的是折叠按钮，继续在折叠区里找");
             chevron=button;from_chevron=true;
         } else {
-            // 旧式托盘：收起的图标位置在隐藏的折叠窗口里，先用「显示隐藏的图标」按钮展开。
-            let tray=FindWindowExW(taskbar,None,w!("TrayNotifyWnd"),PCWSTR::null()).ok();
-            let button=tray.and_then(|t|FindWindowExW(t,None,w!("Button"),PCWSTR::null()).ok());
-            log.step(format!("任务栏上未命中；旧式折叠按钮：{}",button.map(|b|format!("{:#x}",b.0 as usize)).unwrap_or("无".into())));
-            let Some(element)=button.and_then(|b|ui.ElementFromHandle(b).ok()) else {return Err(log.fail("T3","任务栏上找不到微信托盘按钮"));};
+            // 图标可能仍报告收起时的位置；两种识别路径都通过系统折叠按钮展开后重新定位。
+            let Some(element)=tray_overflow_button(&ui,taskbar) else {return Err(log.fail("T3","任务栏上找不到微信托盘按钮或隐藏图标按钮"));};
+            log.step(format!("任务栏上未命中；折叠按钮：{}",describe_element(&element)));
             if !was_open && !invoke(&element){return Err(log.fail("T5","折叠按钮无法按下"));}
             chevron=element;from_chevron=false;
         }
@@ -596,8 +432,7 @@ pub fn open_wechat_from_tray(unread:crate::app::Unread)->Result<(),String>{
             let Some(inside)=tray_rect(host,id).filter(|r|!from_chevron || !rect_center_inside(*r,icon)) else {continue};
             if let Some(button)=button_at(overflow,inside,&mut log){
                 log.step(format!("折叠区 {} 图标位置：{}",class_name(overflow),show_rect(inside)));
-                pressed=still_over_icon(&button,host,id) && invoke(&button);
-                break;
+                if still_over_icon(&button,host,id) && invoke(&button){pressed=true;break;}
             }
         }
         if pressed {return confirmed(account.pid,&mut log);}
@@ -607,85 +442,30 @@ pub fn open_wechat_from_tray(unread:crate::app::Unread)->Result<(),String>{
     }
 }
 
-/// 某个账号进程里用户看得到的主窗口（多开时每个进程一个）：有多个时取最大的，最小化的排在后面。
-unsafe fn visible_main_window_of(pid:u32,source:crate::app::Messenger,paths:&[String])->Option<HWND>{
-    use windows::Win32::Foundation::{BOOL,RECT};
-    struct Find<'a>{pid:u32,source:crate::app::Messenger,paths:&'a [String],best:Option<(i64,HWND)>}
-    unsafe extern "system" fn visit(hwnd:HWND,data:LPARAM)->BOOL{
-        let find=&mut *(data.0 as *mut Find);
-        if window_pid(hwnd)==find.pid && usable_main_frame(hwnd,find.source) && matches(hwnd,find.paths){
-            let mut r=RECT::default();let _=GetWindowRect(hwnd,&mut r);
-            let area=if IsIconic(hwnd).as_bool(){0}else{i64::from(r.right-r.left)*i64::from(r.bottom-r.top)};
-            if find.best.is_none_or(|(old,_)|area>old){find.best=Some((area,hwnd));}
-        }
-        true.into()
-    }
-    let mut find=Find{pid,source,paths,best:None};
-    let _=EnumWindows(Some(visit),LPARAM((&mut find as *mut Find) as isize));
-    find.best.map(|(_,hwnd)|hwnd)
-}
-
-pub fn open_client(source:crate::app::Messenger)->Result<(),String>{
-    use windows::Win32::Foundation::{BOOL,RECT};
-    struct Search {paths:Vec<String>,best:Option<(i64,HWND)>,tray:Vec<HWND>,qq:bool}
-    unsafe extern "system" fn visit(hwnd:HWND,data:LPARAM)->BOOL{
-        let search=&mut *(data.0 as *mut Search);
-        if search.qq{
-            let mut class=[0u16;64];
-            let count=GetClassNameW(hwnd,&mut class).max(0) as usize;
-            let class=String::from_utf16_lossy(&class[..count]);
-            if class=="Electron_NotifyIconHostWindow" && matches(hwnd,&search.paths){search.tray.push(hwnd);}
-            if !matches!(class.as_str(),"Chrome_WidgetWin_1"|"TXGuiFoundation"){return true.into();}
-        }
-        if IsWindowVisible(hwnd).as_bool() && GetWindow(hwnd,GW_OWNER).is_err() && matches(hwnd,&search.paths){
-            let mut r=RECT::default();
-            if GetWindowRect(hwnd,&mut r).is_ok(){
-                let area=i64::from(r.right-r.left)*i64::from(r.bottom-r.top);
-                if area>0 && search.best.is_none_or(|(old,_)|area>old){search.best=Some((area,hwnd));}
-            }
-        }
-        true.into()
-    }
-    let mut search=Search{paths:client_paths(source),best:None,tray:Vec::new(),qq:source==crate::app::Messenger::Qq};
-    let exe=search.paths.iter().find(|p|!p.starts_with('*')).ok_or_else(||format!("未找到{}的安装路径",source.name()))?.clone();
-    unsafe{
-        let _=EnumWindows(Some(visit),LPARAM((&mut search as *mut Search) as isize));
-        if let Some((_,window))=search.best{
-            if IsIconic(window).as_bool(){let _=ShowWindowAsync(window,SW_RESTORE);}
-            if SetForegroundWindow(window).as_bool(){return Ok(());}
-        }
-        if let [host]=search.tray.as_slice(){
-            use windows::Win32::UI::Shell::{Shell_NotifyIconGetRect,NOTIFYICONIDENTIFIER};
-            let mut found=None;
-            for id in 2..=256 {
-                let icon=NOTIFYICONIDENTIFIER{cbSize:std::mem::size_of::<NOTIFYICONIDENTIFIER>() as u32,hWnd:*host,uID:id,..Default::default()};
-                if Shell_NotifyIconGetRect(&icon).is_ok(){
-                    if found.is_some(){found=None;break;} found=Some(id);
-                }
-            }
-            if let Some(id)=found {
-                for event in [WM_LBUTTONDOWN,WM_LBUTTONUP,WM_LBUTTONDBLCLK,WM_LBUTTONUP]{
-                    if !PostMessageW(*host,WM_APP+1,WPARAM(id as usize),LPARAM(event as isize)).is_ok(){return Err("QQ 托盘暂时无法响应，请重试".into());}
-                }
-                return Ok(());
-            }
-        }
-    }
-    std::process::Command::new(exe).spawn().map(|_|()).map_err(|e|format!("无法打开{}：{e}",source.name()))
-}
-
 struct State {
     message: u32,
     taskbar_created: u32,
+    source:crate::messenger::Messenger,
     registered: bool,
     paths: Vec<String>,
-    /// 每个微信进程（账号）各自合并连续闪动。
+    /// 各账号独立合并闪动；确认查看后立即重置。
     burst: Vec<(u32,Burst)>,
     /// 尚未取走的提醒：账号进程与闪动的窗口。
     pending: Vec<(u32,isize)>,
-    /// 当前正在前台查看的账号进程。
-    viewing: Vec<u32>,
     ctx: eframe::egui::Context,
+}
+
+impl State {
+    fn attention(&mut self,pid:u32,window:isize,now:Instant)->bool{
+        if !self.burst.iter().any(|(account,_)|*account==pid){self.burst.push((pid,Burst::default()));}
+        if !self.burst.iter_mut().find(|(account,_)|*account==pid).unwrap().1.attention(now,window){return false;}
+        match self.pending.iter_mut().find(|(account,_)|*account==pid){Some(entry)=>entry.1=window,None=>self.pending.push((pid,window))}
+        true
+    }
+    fn clear(&mut self,pid:u32){
+        self.burst.retain(|(account,_)|*account!=pid);
+        self.pending.retain(|(account,_)|*account!=pid);
+    }
 }
 
 unsafe extern "system" fn subclass(hwnd: HWND, message: u32, wp: WPARAM, lp: LPARAM, _: usize, data: usize) -> LRESULT {
@@ -698,42 +478,24 @@ unsafe extern "system" fn subclass(hwnd: HWND, message: u32, wp: WPARAM, lp: LPA
             }
             if message==state.message && matches!(wp.0, FLASH | 4 | 0x8004) {
                 let target=HWND(lp.0 as *mut _);
-                let foreground=foreground_main_pid(crate::app::Messenger::Wechat,&state.paths);
-                // 刚看过的账号已不在前台（Alt+Tab 切走、点了别的窗口，或漏掉了切换事件）：开始宽限期。
-                let now=Instant::now();
-                let left:Vec<u32>=state.viewing.iter().copied().filter(|p|Some(*p)!=foreground).collect();
-                for pid in left {
-                    trace(format!("切走 账号 {pid}：开始 {}s 宽限期",LEAVE_GRACE.as_secs()));
-                    state.viewing.retain(|p|*p!=pid);
-                    state.burst.retain(|(p,_)|*p!=pid);state.burst.push((pid,Burst::left(now)));
-                }
+                let foreground=foreground_main_pid(state.source,&state.paths);
                 let ours=matches(target,&state.paths);
                 if ours {
-                    trace(format!("{} 目标 {}·进程 {}·{} 前台 {}·微信主窗口进程 {foreground:?}",match wp.0{FLASH=>"闪动",4=>"激活",_=>"激活(rude)"},describe(target),window_pid(target),if ours{"微信"}else{"非微信"},describe(GetForegroundWindow())));
+                    client_trace(state.source,format!("{} 目标 {}·进程 {}·{} 前台 {}·客户端主窗口进程 {foreground:?}",match wp.0{FLASH=>"闪动",4=>"激活",_=>"激活(rude)"},describe(target),window_pid(target),state.source.name(),describe(GetForegroundWindow())));
                 }
                 if ours{
                     let source_pid=window_pid(target);
-                    let pid=if wp.0==FLASH && foreground!=Some(source_pid){
-                        let owners:std::collections::HashSet<_>=tray_hosts(&state.paths).into_iter().map(|(p,_)|p).collect();
-                        if owners.contains(&source_pid){source_pid}else{
-                            account_tray_pid(source_pid,&owners.into_iter().collect::<Vec<_>>(),&parent_processes()).unwrap_or(source_pid)
-                        }
-                    }else{source_pid};
+                    let office=if state.source!=crate::messenger::Messenger::Wechat && wp.0==FLASH{crate::messenger::desktop::flash_target(state.source,target,&state.paths)}else{None};
+                    let pid=if state.source==crate::messenger::Messenger::Wechat{account_pid(source_pid,&state.paths)}else{office.map_or(source_pid,|unread|unread.pid)};
                     if foreground==Some(pid){
-                        if state.pending.iter().any(|(p,_)|*p==pid){trace(format!("  → 账号 {pid} 在前台，清掉待取提醒"));}
+                        if state.pending.iter().any(|(p,_)|*p==pid){client_trace(state.source,format!("  → 账号 {pid} 在前台，清掉待取提醒"));}
                         // 正在看这个账号：它的提醒作废，其它账号不受影响。
-                        state.burst.retain(|(p,_)|*p!=pid);state.pending.retain(|(p,_)|*p!=pid);
-                        if !state.viewing.contains(&pid){state.viewing.push(pid);}
+                        state.clear(pid);
                     }else if wp.0==FLASH {
-                        let fresh={
-                            if !state.burst.iter().any(|(p,_)|*p==pid){state.burst.push((pid,Burst::default()));}
-                            state.burst.iter_mut().find(|(p,_)|*p==pid).is_some_and(|(_,burst)|burst.attention(Instant::now()))
-                        };
-                        trace(format!("  → {}",if fresh{"新提醒"}else{"合并到上一轮 / 宽限期内，不提醒"}));
-                        if fresh {
-                            match state.pending.iter_mut().find(|(p,_)|*p==pid){Some(entry)=>entry.1=target.0 as isize,None=>state.pending.push((pid,target.0 as isize))}
-                            state.ctx.request_repaint();
-                        }
+                        let target=office.map_or(target,|unread|HWND(unread.window as *mut _));
+                        let queued=state.attention(pid,target.0 as isize,Instant::now());
+                        client_trace(state.source,format!("  → {}",if queued{"提交提醒或更新窗口"}else{"合并同一轮闪动"}));
+                        if queued{state.ctx.request_repaint();}
                     }
                 }
             }
@@ -746,14 +508,15 @@ unsafe extern "system" fn subclass(hwnd: HWND, message: u32, wp: WPARAM, lp: LPA
     DefSubclassProc(hwnd,message,wp,lp)
 }
 
+fn client_trace(source:crate::messenger::Messenger,line:String){
+    if source==crate::messenger::Messenger::Wechat{trace(line);}else{crate::messenger::windows::trace(format!("{} {line}",source.name()));}
+}
+
 /// 窗口的简短描述：句柄、类名、可见 / 最小化。不读标题。
 fn describe(hwnd:HWND)->String{
     if hwnd.0.is_null(){return "无".into();}
     unsafe{format!("{:#x} {} {}{}",hwnd.0 as usize,class_name(hwnd),if IsWindowVisible(hwnd).as_bool(){"可见"}else{"隐藏"},if IsIconic(hwnd).as_bool(){"·最小化"}else{""})}
 }
-
-/// 当前前台窗口的描述（给主程序写事件记录用）。
-pub fn describe_foreground()->String{unsafe{let h=GetForegroundWindow();format!("{} 进程 {}",describe(h),window_pid(h))}}
 
 /// 微信提醒事件记录：只保留最近 300 条，写到 diagnostics/wechat-events.log；不记标题和聊天内容。
 pub fn trace(line:impl Into<String>){
@@ -781,7 +544,7 @@ fn process_elevated()->bool{
 pub struct Listener { hwnd: HWND, state: Box<RefCell<State>> }
 impl Listener {
     pub fn new(ctx: eframe::egui::Context) -> Result<Self,String> {
-        let result=Self::start(ctx);
+        let result=Self::start(ctx,crate::messenger::Messenger::Wechat);
         // 每次启动监听都记一条：日志里没有这一行，就说明监听从未启动。
         let elevated=if process_elevated(){"是"}else{"否"};
         match &result {
@@ -790,28 +553,32 @@ impl Listener {
         }
         result
     }
-    fn start(ctx: eframe::egui::Context) -> Result<Self,String> {
-        let paths=installed_paths();
-        if paths.is_empty(){return Err("未找到微信安装路径，请安装微信后重新开启提醒".into());}
+    pub(crate) fn for_client(source:crate::messenger::Messenger,ctx:eframe::egui::Context)->Result<Self,String>{Self::start(ctx,source)}
+    fn start(ctx: eframe::egui::Context,source:crate::messenger::Messenger) -> Result<Self,String> {
+        let paths=client_paths(source);
+        if paths.is_empty(){return Err(format!("未找到{}安装路径，请安装后重新开启提醒",source.name()));}
         unsafe {
             let message=RegisterWindowMessageW(w!("SHELLHOOK"));
-            if message==0{return Err("无法注册微信提醒事件".into());}
+            if message==0{return Err(format!("无法注册{}提醒事件",source.name()));}
             let taskbar_created=RegisterWindowMessageW(w!("TaskbarCreated"));
-            let hwnd=CreateWindowExW(WS_EX_TOOLWINDOW,w!("STATIC"),w!("DaozaiWechatListener"),WS_POPUP,0,0,0,0,None,None,None,None).map_err(|_|"无法创建微信监听窗口")?;
+            let hwnd=CreateWindowExW(WS_EX_TOOLWINDOW,w!("STATIC"),w!("DaozaiWechatListener"),WS_POPUP,0,0,0,0,None,None,None,None).map_err(|_|format!("无法创建{}监听窗口",source.name()))?;
             // 岛仔以管理员身份运行时，系统会拦下资源管理器发来的窗口事件；显式允许这两条消息。
             for allowed in [message,taskbar_created] {
                 let _=ChangeWindowMessageFilterEx(hwnd,allowed,MSGFLT_ALLOW,None);
             }
-            let state=Box::new(RefCell::new(State{message,taskbar_created,registered:true,paths,burst:Vec::new(),pending:Vec::new(),viewing:Vec::new(),ctx}));
+            let state=Box::new(RefCell::new(State{message,taskbar_created,source,registered:true,paths,burst:Vec::new(),pending:Vec::new(),ctx}));
             let listener=Self{hwnd,state};
-            SetWindowSubclass(hwnd,Some(subclass),SUBCLASS_ID,(&*listener.state as *const RefCell<State>) as usize).ok().map_err(|_|"无法接入微信提醒事件")?;
-            RegisterShellHookWindow(hwnd).ok().map_err(|_|"无法监听微信任务栏提醒")?;
+            SetWindowSubclass(hwnd,Some(subclass),SUBCLASS_ID,(&*listener.state as *const RefCell<State>) as usize).ok().map_err(|_|format!("无法接入{}提醒事件",source.name()))?;
+            RegisterShellHookWindow(hwnd).ok().map_err(|_|format!("无法监听{}任务栏提醒",source.name()))?;
             Ok(listener)
         }
     }
     pub fn registered(&self)->bool{self.state.borrow().registered}
     /// 取走新提醒：每项是（账号进程，闪动的窗口）。
     pub fn take(&self) -> Vec<(u32,isize)> {std::mem::take(&mut self.state.borrow_mut().pending)}
+    pub fn forget(&self,pid:u32){
+        self.state.borrow_mut().clear(pid);
+    }
 }
 impl Drop for Listener {
     fn drop(&mut self){unsafe{
@@ -824,6 +591,55 @@ impl Drop for Listener {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn all_taskbar_clients_first_flash_after_minimizing_a_viewed_account_is_not_swallowed(){unsafe{
+        use crate::messenger::Messenger;
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        unsafe extern "system" fn proc(h:HWND,m:u32,w:WPARAM,l:LPARAM)->LRESULT{DefWindowProcW(h,m,w,l)}
+        let instance=GetModuleHandleW(None).unwrap().into();let pid=std::process::id();
+        for (source,class) in [(Messenger::Wechat,w!("WeChatMainWndForPC")),(Messenger::WeCom,w!("WeWorkWindow")),(Messenger::Feishu,w!("Chrome_WidgetWin_1")),(Messenger::DingTalk,w!("Qt51511QWindowIcon")),(Messenger::DingTalk,w!("StandardFrame_DingTalk"))]{
+            RegisterClassW(&WNDCLASSW{lpfnWndProc:Some(proc),hInstance:instance,lpszClassName:class,..Default::default()});
+            let window=CreateWindowExW(WINDOW_EX_STYLE(0),class,w!("Daozai synthetic client"),WS_OVERLAPPEDWINDOW,-10000,-10000,400,500,None,None,instance,None).unwrap();
+            let hwnd=CreateWindowExW(WS_EX_TOOLWINDOW,w!("STATIC"),w!(""),WS_POPUP,0,0,0,0,None,None,None,None).unwrap();
+            let message=RegisterWindowMessageW(w!("SHELLHOOK"));
+            let state=Box::new(RefCell::new(State{message,taskbar_created:RegisterWindowMessageW(w!("TaskbarCreated")),source,registered:true,paths:vec![normalized(&std::env::current_exe().unwrap().to_string_lossy())],burst:Vec::new(),pending:Vec::new(),ctx:Default::default()}));
+            SetWindowSubclass(hwnd,Some(subclass),SUBCLASS_ID,(&*state as *const RefCell<State>)as usize).ok().unwrap();
+            let listener=Listener{hwnd,state};
+            listener.forget(pid);
+            // 只向本测试的监听窗口模拟事件；隐藏的合成主窗口代表已从前台收起。
+            SendMessageW(hwnd,message,WPARAM(FLASH),LPARAM(window.0 as isize));let first=listener.take();
+            SendMessageW(hwnd,message,WPARAM(FLASH),LPARAM(window.0 as isize));let repeated=listener.take();
+            DestroyWindow(window).unwrap();drop(listener);
+            assert_eq!(first,[(pid,window.0 as isize)],"{} 收起后的第一轮消息不能被查看后的宽限期吞掉",source.name());
+            assert!(repeated.is_empty(),"同一轮持续闪动仍只提醒一次");
+        }
+    }}
+    #[test]
+    fn office_shell_events_preserve_unknown_instances_until_a_new_unambiguous_event(){unsafe{
+        use crate::messenger::Messenger;
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        unsafe extern "system" fn proc(h:HWND,m:u32,w:WPARAM,l:LPARAM)->LRESULT{DefWindowProcW(h,m,w,l)}
+        let instance=GetModuleHandleW(None).unwrap().into();let pid=std::process::id();
+        for (source,class) in [(Messenger::WeCom,w!("WeWorkWindow")),(Messenger::Feishu,w!("Chrome_WidgetWin_1")),(Messenger::DingTalk,w!("Qt51511QWindowIcon"))]{
+            RegisterClassW(&WNDCLASSW{lpfnWndProc:Some(proc),hInstance:instance,lpszClassName:class,..Default::default()});
+            let create=||CreateWindowExW(WINDOW_EX_STYLE(0),class,w!("Daozai synthetic client"),WS_OVERLAPPEDWINDOW,-10000,-10000,400,500,None,None,instance,None).unwrap();
+            let (first,second)=(create(),create());
+            let hwnd=CreateWindowExW(WS_EX_TOOLWINDOW,w!("STATIC"),w!(""),WS_POPUP,0,0,0,0,None,None,None,None).unwrap();
+            let message=RegisterWindowMessageW(w!("SHELLHOOK"));
+            let state=Box::new(RefCell::new(State{message,taskbar_created:RegisterWindowMessageW(w!("TaskbarCreated")),source,registered:true,paths:vec![normalized(&std::env::current_exe().unwrap().to_string_lossy())],burst:Vec::new(),pending:Vec::new(),ctx:Default::default()}));
+            SetWindowSubclass(hwnd,Some(subclass),SUBCLASS_ID,(&*state as *const RefCell<State>)as usize).ok().unwrap();
+            let listener=Listener{hwnd,state};
+            // 模拟消息只发给本测试自己的监听窗口，不发送给任何真实客户端。
+            SendMessageW(hwnd,message,WPARAM(FLASH),LPARAM(first.0 as isize));
+            assert_eq!(listener.take(),[(0,0)]);
+            SendMessageW(hwnd,message,WPARAM(FLASH),LPARAM(first.0 as isize));assert!(listener.take().is_empty());
+            listener.forget(0);DestroyWindow(second).unwrap();
+            SendMessageW(hwnd,message,WPARAM(FLASH),LPARAM(first.0 as isize));
+            assert_eq!(listener.take(),[(pid,first.0 as isize)],"只能让新的确定事件产生新的已知提醒");
+            DestroyWindow(first).unwrap();drop(listener);
+        }
+    }}
+    use crate::messenger::windows::open_unread_with_paths;
     #[test]
     fn clicking_wechat_flash_never_shows_hidden_helper(){unsafe{
         let window=CreateWindowExW(WS_EX_TOOLWINDOW,w!("STATIC"),w!(""),WS_POPUP,0,0,0,0,None,None,None,None).unwrap();
@@ -945,6 +761,116 @@ mod tests {
         assert!(parents.contains_key(&std::process::id()));
         assert!(!ancestors(std::process::id(),&parents).is_empty(),"测试进程应有父进程");
     }
+    struct TrayFixture {window:HWND,thread:Option<std::thread::JoinHandle<()>>,clicks:std::sync::Arc<std::sync::atomic::AtomicUsize>}
+    impl TrayFixture {
+        fn new(legacy:bool,buttons:&[(&str,bool,bool)])->Self{
+            use std::sync::{Arc,atomic::{AtomicUsize,Ordering}};
+            let buttons=buttons.iter().map(|(name,enabled,visible)|(name.to_string(),*enabled,*visible)).collect::<Vec<_>>();
+            let clicks=Arc::new(AtomicUsize::new(0));let received=clicks.clone();
+            let (tx,rx)=std::sync::mpsc::channel();
+            let thread=std::thread::spawn(move||unsafe{
+                use windows::Win32::{Foundation::COLORREF,System::LibraryLoader::GetModuleHandleW,UI::Input::KeyboardAndMouse::EnableWindow};
+                unsafe extern "system" fn proc(h:HWND,m:u32,w:WPARAM,l:LPARAM)->LRESULT{
+                    if m==WM_COMMAND {
+                        let clicks=GetWindowLongPtrW(h,GWLP_USERDATA) as *const AtomicUsize;
+                        if !clicks.is_null(){(*clicks).fetch_add(1,Ordering::SeqCst);}
+                    }
+                    if m==WM_DESTROY{PostQuitMessage(0);}
+                    DefWindowProcW(h,m,w,l)
+                }
+                unsafe extern "system" fn child_proc(h:HWND,m:u32,w:WPARAM,l:LPARAM)->LRESULT{DefWindowProcW(h,m,w,l)}
+                let instance=GetModuleHandleW(None).unwrap().into();
+                RegisterClassW(&WNDCLASSW{lpfnWndProc:Some(proc),hInstance:instance,lpszClassName:w!("DaozaiTrayFixture"),..Default::default()});
+                RegisterClassW(&WNDCLASSW{lpfnWndProc:Some(child_proc),hInstance:instance,lpszClassName:w!("TrayNotifyWnd"),..Default::default()});
+                // 透明窗口只提供系统无障碍控件，不显示界面，也不抢占前台。
+                let window=CreateWindowExW(WS_EX_LAYERED|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,w!("DaozaiTrayFixture"),w!(""),WS_POPUP,10,10,240,220,None,None,instance,None).unwrap();
+                SetLayeredWindowAttributes(window,COLORREF(0),0,LWA_ALPHA).unwrap();
+                SetWindowLongPtrW(window,GWLP_USERDATA,Arc::as_ptr(&received) as isize);
+                let parent=if legacy{CreateWindowExW(WINDOW_EX_STYLE(0),w!("TrayNotifyWnd"),w!(""),WS_CHILD|WS_VISIBLE,0,0,240,220,window,None,instance,None).unwrap()}else{window};
+                for (i,(name,enabled,visible)) in buttons.iter().enumerate(){
+                    let style=WS_CHILD|if *visible{WS_VISIBLE}else{WINDOW_STYLE(0)};
+                    let button=CreateWindowExW(WINDOW_EX_STYLE(0),w!("Button"),&windows::core::HSTRING::from(name),style,4,4+i as i32*40,200,32,parent,None,instance,None).unwrap();
+                    let _=EnableWindow(button,*enabled);
+                }
+                let _=ShowWindow(window,SW_SHOWNOACTIVATE);tx.send(window.0 as isize).unwrap();
+                let mut message=MSG::default();while GetMessageW(&mut message,None,0,0).0>0{let _=TranslateMessage(&message);DispatchMessageW(&message);}
+            });
+            Self{window:HWND(rx.recv_timeout(Duration::from_secs(5)).unwrap() as *mut _),thread:Some(thread),clicks}
+        }
+    }
+    impl Drop for TrayFixture{fn drop(&mut self){unsafe{let _=PostMessageW(self.window,WM_CLOSE,WPARAM(0),LPARAM(0));}if let Some(thread)=self.thread.take(){thread.join().unwrap();}}}
+
+    #[test]
+    fn tray_overflow_button_supports_legacy_and_modern_layouts(){unsafe{
+        use windows::Win32::{System::Com::*,UI::Accessibility::*};
+        let _=CoInitializeEx(None,COINIT_MULTITHREADED);
+        let ui:IUIAutomation=CoCreateInstance(&CUIAutomation8,None,CLSCTX_INPROC_SERVER).unwrap();
+        for legacy in [true,false]{
+            let fixture=TrayFixture::new(legacy,&[("显示隐藏的图标",true,true)]);
+            let button=tray_overflow_button(&ui,fixture.window).unwrap_or_else(||panic!("未找到折叠按钮，旧式布局={legacy}"));
+            assert_eq!(button.CurrentName().unwrap().to_string(),"显示隐藏的图标");
+            button.GetCurrentPatternAs::<IUIAutomationInvokePattern>(UIA_InvokePatternId).unwrap().Invoke().unwrap();
+            if !legacy{
+                let until=Instant::now()+Duration::from_secs(2);
+                while fixture.clicks.load(std::sync::atomic::Ordering::SeqCst)==0 && Instant::now()<until{std::thread::sleep(Duration::from_millis(10));}
+                assert_eq!(fixture.clicks.load(std::sync::atomic::Ordering::SeqCst),1);
+            }
+        }
+    }}
+
+    #[test]
+    fn tray_overflow_button_rejects_unusable_or_ambiguous_controls(){unsafe{
+        use windows::Win32::{System::Com::*,UI::Accessibility::*};
+        let _=CoInitializeEx(None,COINIT_MULTITHREADED);
+        let ui:IUIAutomation=CoCreateInstance(&CUIAutomation8,None,CLSCTX_INPROC_SERVER).unwrap();
+        for legacy in [true,false]{
+            for buttons in [vec![("显示隐藏的图标",false,true)],vec![("显示隐藏的图标",true,false)]]{
+                let fixture=TrayFixture::new(legacy,&buttons);
+                assert!(tray_overflow_button(&ui,fixture.window).is_none(),"不得点击不可用的按钮：{buttons:?}");
+            }
+        }
+        for buttons in [vec![("微信",true,true)],vec![("显示隐藏的图标",true,true),("Show hidden icons",true,true)]]{
+            let fixture=TrayFixture::new(false,&buttons);
+            assert!(tray_overflow_button(&ui,fixture.window).is_none(),"不得点击不确定的按钮：{buttons:?}");
+        }
+        for name in ["Show hidden icons","顯示隱藏的圖示"]{
+            let fixture=TrayFixture::new(false,&[(name,true,true)]);
+            assert!(tray_overflow_button(&ui,fixture.window).is_some(),"未识别系统语言：{name}");
+        }
+    }}
+
+    #[test]
+    fn tray_overflow_lookup_recovers_after_taskbar_reveal_without_cached_coordinates(){unsafe{
+        use windows::Win32::{Foundation::RECT,Graphics::Gdi::*,System::Com::*,UI::Accessibility::*};
+        let _=CoInitializeEx(None,COINIT_MULTITHREADED);
+        let ui:IUIAutomation=CoCreateInstance(&CUIAutomation8,None,CLSCTX_INPROC_SERVER).unwrap();
+        let fixture=TrayFixture::new(false,&[("显示隐藏的图标",true,true)]);
+        assert!(taskbar_fully_shown(fixture.window));
+        let rect=window_rect(fixture.window);
+        let mut monitor=MONITORINFO{cbSize:std::mem::size_of::<MONITORINFO>() as u32,..Default::default()};
+        GetMonitorInfoW(MonitorFromWindow(fixture.window,MONITOR_DEFAULTTONEAREST),&mut monitor).ok().unwrap();
+        SetWindowPos(fixture.window,None,rect.left,monitor.rcMonitor.bottom-1,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE).unwrap();
+        assert!(!taskbar_fully_shown(fixture.window),"仅露出一个像素时应等待任务栏展开");
+        SetWindowPos(fixture.window,None,rect.left,rect.top,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE).unwrap();
+        assert!(taskbar_fully_shown(fixture.window));
+        let button=tray_overflow_button(&ui,fixture.window).expect("任务栏展开后应重新查找新版折叠按钮");
+        let bounds=button.CurrentBoundingRectangle().unwrap();
+        let reported=RECT{left:17,top:1631,right:57,bottom:1671};
+        assert!(!button_sized(reported,bounds),"用户日志中的旧坐标不应命中新按钮");
+        assert!(button_sized(bounds,bounds));
+    }}
+
+    #[test]
+    #[ignore="只读检查本机任务栏，需要通知区域含有隐藏图标"]
+    fn local_tray_overflow_button_is_discoverable(){unsafe{
+        use windows::Win32::{System::Com::*,UI::Accessibility::*};
+        let _=CoInitializeEx(None,COINIT_MULTITHREADED);
+        let ui:IUIAutomation=CoCreateInstance(&CUIAutomation8,None,CLSCTX_INPROC_SERVER).unwrap();
+        let taskbar=FindWindowW(w!("Shell_TrayWnd"),PCWSTR::null()).unwrap();
+        let button=tray_overflow_button(&ui,taskbar).expect("未找到本机隐藏图标按钮");
+        println!("本机折叠按钮：{} · {}",button.CurrentClassName().unwrap(),show_rect(button.CurrentBoundingRectangle().unwrap()));
+    }}
+
     #[test]
     fn tray_buttons_match_by_icon_center(){
         use windows::Win32::Foundation::RECT;
@@ -1056,7 +982,7 @@ mod tests {
     fn shell_notifications_filter_targets_merge_flashes_and_detach(){unsafe{
         let hwnd=CreateWindowExW(WS_EX_TOOLWINDOW,w!("STATIC"),w!(""),WS_POPUP,0,0,0,0,None,None,None,None).unwrap();
         let message=RegisterWindowMessageW(w!("SHELLHOOK"));
-        let state=Box::new(RefCell::new(State{message,taskbar_created:RegisterWindowMessageW(w!("TaskbarCreated")),registered:true,paths:vec![],burst:Vec::new(),pending:Vec::new(),viewing:Vec::new(),ctx:Default::default()}));
+        let state=Box::new(RefCell::new(State{message,taskbar_created:RegisterWindowMessageW(w!("TaskbarCreated")),source:crate::messenger::Messenger::Wechat,registered:true,paths:vec![],burst:Vec::new(),pending:Vec::new(),ctx:Default::default()}));
         SetWindowSubclass(hwnd,Some(subclass),SUBCLASS_ID,(&*state as *const RefCell<State>) as usize).ok().unwrap();
         RegisterShellHookWindow(hwnd).ok().unwrap();
         let listener=Listener{hwnd,state};
@@ -1069,7 +995,7 @@ mod tests {
         SendMessageW(hwnd,message,WPARAM(FLASH),LPARAM(hwnd.0 as isize));assert!(listener.take().is_empty());
         SendMessageW(hwnd,message,WPARAM(4),LPARAM(hwnd.0 as isize));
         SendMessageW(hwnd,message,WPARAM(FLASH),LPARAM(hwnd.0 as isize));assert!(listener.take().is_empty());
-        listener.state.borrow_mut().burst.clear();
+        listener.forget(std::process::id());
         SendMessageW(hwnd,message,WPARAM(FLASH),LPARAM(hwnd.0 as isize));
         SendMessageW(hwnd,message,WPARAM(0x8004),LPARAM(hwnd.0 as isize));
         assert!(!listener.take().is_empty(),"后台窗口的激活事件应保留尚未消费的提醒");
@@ -1079,13 +1005,19 @@ mod tests {
         drop(listener);assert!(!IsWindow(hwnd).as_bool());
     }}
     #[test]
-    fn continuous_flashes_are_one_reminder_and_quiet_gap_rearms(){
-        let start=Instant::now();let mut burst=Burst::default();
-        assert!(burst.attention(start));
-        for second in 1..30 {assert!(!burst.attention(start+Duration::from_secs(second)));}
-        assert!(burst.attention(start+Duration::from_secs(34)));
-        burst=Burst::default();
-        assert!(burst.attention(start+Duration::from_secs(35)));
+    fn viewed_accounts_rearm_immediately_without_resetting_other_accounts(){
+        let mut state=State{message:0,taskbar_created:0,source:crate::messenger::Messenger::Wechat,registered:false,paths:vec![],burst:vec![],pending:vec![],ctx:Default::default()};
+        let start=Instant::now();
+        assert!(state.attention(100,11,start));assert!(state.attention(200,22,start));assert!(state.attention(0,0,start));
+        state.pending.clear();
+        state.clear(0);
+        assert!(!state.attention(100,11,start+Duration::from_millis(100)),"关闭未知账号不能重置其他账号的闪动合并");
+        assert!(!state.attention(200,22,start+Duration::from_millis(100)));
+        assert!(state.attention(0,0,start+Duration::from_millis(100)));
+        state.clear(100);assert!(state.attention(100,11,start+Duration::from_millis(200)),"确认查看后，下一轮立即可提醒");
+        assert!(!state.attention(200,22,start+Duration::from_millis(200)));
+        assert!(state.attention(200,23,start+Duration::from_millis(300)),"窗口变化必须及时传给界面更新唤起目标");
+        assert_eq!(state.burst.iter().filter(|(pid,_)|*pid==200).count(),1);
     }
     #[test]
     fn wechat_is_recognized_by_tencent_file_name_when_registry_path_is_stale(){
@@ -1101,18 +1033,6 @@ mod tests {
             assert!(path_allowed(&real,&stale));
             assert!(!path_allowed(&real,&[normalized(r"C:\Old\Weixin\Weixin.exe"),"*qq.exe".into()]),"文件名不对不得认作其它客户端");
         }
-    }
-    #[test]
-    fn flashes_right_after_leaving_a_viewed_account_do_not_remind_again(){
-        // 群友反馈：最小化收到消息 → Alt+Tab 过去看了 → 再 Alt+Tab 切走，未读又出现。
-        let start=Instant::now();
-        let mut burst=Burst::left(start);
-        assert!(!burst.attention(start+Duration::from_millis(200)),"切走时的补闪不算新提醒");
-        assert!(!burst.attention(start+Duration::from_secs(3)),"宽限期内的闪动不算");
-        for second in 4..20 {assert!(!burst.attention(start+Duration::from_secs(second)),"补闪持续不断时继续合并：{second}s");}
-        assert!(burst.attention(start+Duration::from_secs(26)),"安静五秒后的新消息照常提醒");
-        let mut quiet=Burst::left(start);
-        assert!(quiet.attention(start+Duration::from_secs(10)),"切走后过了宽限期且没有补闪，新消息照常提醒");
     }
     #[test]
     fn paths_match_full_install_location(){

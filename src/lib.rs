@@ -6,11 +6,17 @@
 //! - `native` / `tray`：仅 Windows 的窗口区域、命中穿透与托盘
 
 pub mod display_layout;
+pub mod diagnostics_tool;
+pub mod rtl_text;
 mod mail_privacy;
 pub mod poll_clock;
 pub mod resources;
 pub mod anim;
+pub mod oled_shift;
 pub mod app;
+pub mod messenger;
+pub mod child_process;
+mod settings_window;
 pub mod bt;
 pub mod calendar;
 mod calendar_ui;
@@ -22,6 +28,7 @@ pub mod icons;
 pub mod input;
 pub mod lyrics;
 pub mod mail;
+pub mod mail_format;
 mod mail_reader;
 pub mod mail_manage;
 mod mail_manage_ui;
@@ -29,9 +36,14 @@ pub mod clipboard;
 pub mod side_dock;
 mod task_picker;
 pub mod model;
+pub mod renderer;
 pub mod otp;
 pub mod quota;
 mod quota_ui;
+pub mod weather;
+mod weather_ui;
+mod weather_source_ui;
+mod qweather;
 mod pages;
 mod extras;
 mod pet;
@@ -45,11 +57,14 @@ pub mod backdrop;
 #[cfg(windows)]
 pub mod composition;
 #[cfg(windows)]
+pub mod layered;
+#[cfg(windows)]
 pub mod system;
 pub mod paint;
 pub mod shape;
 mod fluid;
 pub mod smtc;
+pub mod music_volume;
 pub mod theme;
 pub mod settings_theme;
 mod updates;

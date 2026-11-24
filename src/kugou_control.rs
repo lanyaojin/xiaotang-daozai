@@ -52,8 +52,7 @@ pub fn seek(seconds:f64)->bool {
     if std::fs::create_dir_all(path.parent().unwrap()).is_err(){return false;}
     let payload=serde_json::json!({"out":path}).to_string();
     let uri=format!("kugou://workbuddy?p={}",base64::engine::general_purpose::STANDARD.encode(payload));
-    use std::os::windows::process::CommandExt;
-    if std::process::Command::new(executable).arg(uri).creation_flags(0x08000000).spawn().is_err(){return false;}
+    if crate::child_process::spawn(std::process::Command::new(executable).arg(uri)).is_err(){return false;}
     let started=std::time::Instant::now();
     while started.elapsed()<Duration::from_secs(3) {
         std::thread::sleep(Duration::from_millis(100));

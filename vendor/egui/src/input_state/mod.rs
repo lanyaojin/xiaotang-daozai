@@ -496,7 +496,8 @@ impl InputState {
         if self.pointer.wants_repaint()
             || self.unprocessed_scroll_delta.abs().max_elem() > 0.2
             || self.unprocessed_scroll_delta_for_zoom.abs() > 0.2
-            || !self.events.is_empty()
+            // 岛仔：截图结果不是用户输入，不需要因它再多画两帧（兼容渲染每次读回都会收到一个截图事件）。
+            || self.events.iter().any(|event| !matches!(event, crate::Event::Screenshot { .. }))
         {
             // Immediate repaint
             return Some(Duration::ZERO);

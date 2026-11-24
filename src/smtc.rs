@@ -1,12 +1,20 @@
 //! 系统媒体会话（SMTC）读取：Windows 10/11 的“正在播放”。
 //! 与原工具使用同一套 API（GlobalSystemMediaTransportControlsSessionManager）。
 
+#[path="apple_music.rs"]
+mod apple_music;
 #[cfg(windows)]
 #[path="netease_timeline.rs"]
 mod netease_timeline;
 #[cfg(windows)]
 #[path="netease_playback.rs"]
 mod netease_playback;
+#[cfg(windows)]
+#[path="bodian.rs"]
+pub(crate) mod bodian;
+#[cfg(windows)]
+#[path="kuwo.rs"]
+pub(crate) mod kuwo;
 #[cfg(windows)]
 #[path="kugou_metadata.rs"]
 mod kugou_metadata;
@@ -16,6 +24,20 @@ mod kugou_control;
 #[cfg(windows)]
 #[path="player_seek.rs"]
 mod player_seek;
+#[cfg(windows)]
+#[path="player_process.rs"]
+pub(crate) mod player_process;
+#[cfg(windows)]
+#[path="music_log.rs"]
+mod music_log;
+
+#[cfg(windows)]
+#[path="music_gaps.rs"]
+mod music_gaps;
+
+#[cfg(windows)]
+#[path="cover_search.rs"]
+mod cover_search;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -44,6 +66,8 @@ pub struct NowPlaying {
     pub duration: f64,
     pub artwork: Option<Arc<eframe::egui::ColorImage>>,
     pub playback_type: MediaKind,
+    /// 当前播放器在 Windows 音量混合器中的音量与静音状态。
+    pub volume: Option<(u32,bool)>,
 }
 
 impl NowPlaying {
@@ -56,7 +80,7 @@ impl NowPlaying {
             return MediaKind::Video;
         }
         let source=self.source.to_lowercase();
-        if matches!(source.as_str(),"kugou"|"kugou.exe"|"qqmusic"|"qqmusic.exe"|"cloudmusic.exe"|"汽水音乐"|"sodamusic.exe"|"spotify"|"spotify.exe"|"kwmusic.exe") && self.playback_type==MediaKind::Music{return MediaKind::Music;}
+        if (matches!(source.as_str(),"kugou"|"kugou.exe"|"cloudmusic.exe"|"汽水音乐"|"sodamusic.exe"|"spotify"|"spotify.exe"|"kwmusic.exe"|"bodian_pc.exe") || is_qqmusic(&source) || apple_music::is_source(&source)) && self.playback_type==MediaKind::Music{return MediaKind::Music;}
         if ["chrome","msedge","firefox","brave","opera"].iter().any(|name|source.contains(name)) {
             let album=self.album.trim().to_lowercase();
             if ["youtube","bilibili","抖音","哔哩哔哩"].contains(&album.as_str()){return MediaKind::Video;}
@@ -222,6 +246,12 @@ fn read_artwork(props:&windows::Media::Control::GlobalSystemMediaTransportContro
     Some(bytes)
 }
 
+/// QQ 音乐在系统媒体会话里的身份名：22.76 及以前是 `QQMusic.exe`，22.82 起改为 `Tencent.QQMusic`。
+/// 进度拖动、音量都要认出它；会话查找仍用原始身份名。
+pub(crate) fn is_qqmusic(source:&str)->bool {
+    matches!(source.to_ascii_lowercase().as_str(),"qqmusic"|"qqmusic.exe"|"tencent.qqmusic")
+}
+
 pub type Shared = Arc<Mutex<NowPlaying>>;
 
 pub fn shared() -> Shared {
@@ -230,9 +260,10 @@ pub fn shared() -> Shared {
 
 fn choose_media(system:Option<NowPlaying>,native:Option<NowPlaying>)->Option<NowPlaying>{
     if let (Some(system),Some(native))=(&system,&native){
-        if system.source.eq_ignore_ascii_case("cloudmusic.exe"){
+        if system.source.eq_ignore_ascii_case("cloudmusic.exe") && native.source.eq_ignore_ascii_case("cloudmusic.exe"){
             // SMTC 与网易云日志的歌手分隔符、合唱署名写法不同；按规范化后的歌名与歌手集合判断，避免同一首歌丢失 song_id。
-            let same=crate::lyrics::same_song(&system.title,&system.artist,&native.title,&native.artist);
+            // 系统会话常只报主艺人（如「雄之助」对「雄之助、WaMi」），署名一方包含另一方也算同一首（#202）。
+            let same=crate::lyrics::song_relation(&system.title,&system.artist,&native.title,&native.artist).is_some();
             let newer=match (native.event_time_ms,system.event_time_ms){(Some(n),Some(s))=>Some(n>s),_=>None};
             let use_native=newer.unwrap_or(same && system.playing==native.playing);
             let mut media=if use_native{native.clone()}else{system.clone()};
@@ -291,6 +322,7 @@ fn query_system(artwork:&mut ArtworkCache) -> Result<Option<NowPlaying>,()> {
         media.map(|media|(session,media))
     })
         .min_by_key(|(_,media)|media_rank(media)).ok_or(())?;
+    music_log::player(&media.source);
     // 当前播放器正在重载时，不把暂停中的另一客户端当成用户切换了播放源。
     if media_rank(&media)>0 && unreadable_previous{return Err(());}
     let key=format!("{}|{}|{}|{}",media.source,media.title,media.artist,media.album);
@@ -369,10 +401,13 @@ fn read_session(session:&windows::Media::Control::GlobalSystemMediaTransportCont
             position=current;sampled_at=Some(std::time::Instant::now());has_position=true;
         }
     }
-    let album=media_text(props.AlbumTitle())?;
+    let mut album=media_text(props.AlbumTitle())?;
+    if apple_music::is_source(&source){
+        (artist,album)=apple_music::metadata(artist,album);
+    }
     if !has_position{sampled_at=None;}
     let playback_type=match playback_type.map(|kind|kind.0){Some(1)=>MediaKind::Music,Some(2)=>MediaKind::Video,_=>MediaKind::Unknown};
-    Some(NowPlaying { title, artist, album, source, song_id:None, playing, position, sampled_at, event_time_ms, duration, artwork:None, playback_type })
+    Some(NowPlaying { title, artist, album, source, song_id:None, playing, position, sampled_at, event_time_ms, duration, artwork:None, playback_type, volume:None })
 }
 
 #[cfg(not(windows))]
@@ -387,13 +422,20 @@ pub enum Transport {
     Prev,
     /// 跳到第几秒。
     Seek(f64),
+    SetVolume(u32),
+    SetMute(bool),
 }
 
 type ControlRequest=(Transport,String,std::time::Instant,Option<std::sync::mpsc::SyncSender<bool>>);
 pub struct ControlWorker {requests:std::sync::mpsc::SyncSender<ControlRequest>}
 impl ControlWorker {
     pub fn start(ctx:eframe::egui::Context)->Option<Self>{
-        Self::start_with(ctx,|command,source|match command{Transport::Seek(seconds)=>seek(seconds,source),_=>{control(command,source);true}})
+        Self::start_with(ctx,|command,source|match command{
+            Transport::Seek(seconds)=>seek(seconds,source),
+            Transport::SetVolume(percent)=>crate::music_volume::set_volume(source,percent),
+            Transport::SetMute(muted)=>crate::music_volume::set_mute(source,muted),
+            _=>{control(command,source);true}
+        })
     }
     fn start_with(ctx:eframe::egui::Context,handle:impl Fn(Transport,&str)->bool+Send+'static)->Option<Self>{
         let (requests,rx)=std::sync::mpsc::sync_channel::<ControlRequest>(8);
@@ -405,7 +447,8 @@ impl ControlWorker {
                 while let Ok(next)=rx.try_recv(){batch.push(next);}
                 let mut batch=batch.into_iter().peekable();
                 while let Some((command,source,created,result))=batch.next(){
-                    let superseded=matches!(command,Transport::Seek(_)) && batch.peek().is_some_and(|next|matches!(next.0,Transport::Seek(_)) && next.1==source);
+                    let superseded=batch.peek().is_some_and(|next|next.1==source && matches!((command,next.0),
+                        (Transport::Seek(_),Transport::Seek(_)) | (Transport::SetVolume(_),Transport::SetVolume(_))));
                     let success=if superseded {false}
                         else if created.elapsed()>Duration::from_secs(5){crate::resources::CONTROL_DROPPED.fetch_add(1,std::sync::atomic::Ordering::Relaxed);false}
                         else{handle(command,&source)};
@@ -416,7 +459,7 @@ impl ControlWorker {
         Some(Self{requests})
     }
     pub fn submit(&self,command:Transport,source:String)->Result<Option<std::sync::mpsc::Receiver<bool>>,()>{
-        let (result,receiver)=if matches!(command,Transport::Seek(_)){let (tx,rx)=std::sync::mpsc::sync_channel(1);(Some(tx),Some(rx))}else{(None,None)};
+        let (result,receiver)=if matches!(command,Transport::Seek(_)|Transport::SetVolume(_)|Transport::SetMute(_)){let (tx,rx)=std::sync::mpsc::sync_channel(1);(Some(tx),Some(rx))}else{(None,None)};
         self.requests.try_send((command,source,std::time::Instant::now(),result)).map_err(|_|{crate::resources::CONTROL_DROPPED.fetch_add(1,std::sync::atomic::Ordering::Relaxed);})?;
         Ok(receiver)
     }
@@ -425,7 +468,11 @@ impl ControlWorker {
 /// 控制当前媒体会话（播放/暂停、上一首、下一首）。
 #[cfg(windows)]
 pub fn control(cmd: Transport,source:&str) {
+    if let Transport::SetVolume(percent)=cmd {crate::music_volume::set_volume(source,percent);return;}
+    if let Transport::SetMute(muted)=cmd {crate::music_volume::set_mute(source,muted);return;}
     if let Transport::Seek(seconds)=cmd {let _=seek(seconds,source);return;}
+    if source.eq_ignore_ascii_case("bodian_pc.exe"){let _=bodian::control(cmd);return;}
+    if source.eq_ignore_ascii_case("kwmusic.exe"){let _=kuwo::control(cmd);return;}
     use windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager;
     let _apartment=init_winrt();
     let session=media_result(GlobalSystemMediaTransportControlsSessionManager::RequestAsync)
@@ -439,11 +486,27 @@ pub fn control(cmd: Transport,source:&str) {
         Transport::Next => session.TrySkipNextAsync(),
         Transport::Prev => session.TrySkipPreviousAsync(),
         Transport::Seek(secs) => session.TryChangePlaybackPositionAsync((secs.max(0.0) * 10_000_000.0) as i64),
+        Transport::SetVolume(_)|Transport::SetMute(_)=>unreachable!(),
     });
 }
 
 #[cfg(not(windows))]
 pub fn control(_cmd: Transport,_source:&str) {}
+
+/// QQ 音乐自带的 `/seekto <秒>` 命令：由客户端的单实例通道转交给正在运行的 QQ 音乐，不依赖窗口和界面结构，
+/// 最小化时同样有效。22.82 起界面改由 QBCore 渲染、点击进度条的回退失效，系统跳转也只回报成功不实际跳转，
+/// 这是新版唯一可用的跳转方式（本机 22.82 实测）。只在 QQ 音乐已运行时调用其自身程序，不会启动新的客户端。
+/// 方案来自 cayww 的 PR #162。
+#[cfg(windows)]
+fn qq_seek_command(seconds:f64)->bool{
+    let Some(path)=player_process::pids_named("QQMusic.exe").into_iter().find_map(player_process::image_path) else{return false;};
+    let directory=std::path::Path::new(&path).parent().map(std::path::Path::to_path_buf);
+    let mut command=std::process::Command::new(&path);
+    if let Some(directory)=directory {command.current_dir(directory);}
+    command.arg("/seekto").arg((seconds.max(0.0).round() as u64).to_string())
+        .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+        .spawn().is_ok()
+}
 
 /// 跳转在工作线程执行；专用回退必须回读实际位置，避免播放器接口假成功。
 #[cfg(windows)]
@@ -451,12 +514,18 @@ pub fn seek(seconds:f64,source:&str)->bool {
     if !seconds.is_finite() || seconds<0.0{return false;}
     static LOCK:Mutex<()>=Mutex::new(());
     let Ok(_lock)=LOCK.lock()else{return false;};
-    if matches!(source.to_ascii_lowercase().as_str(),"kugou"|"kugou.exe") && kugou_control::seek(seconds){return true;}
+    if source.eq_ignore_ascii_case("kwmusic.exe"){return kuwo::seek(seconds);}
+    if matches!(source.to_ascii_lowercase().as_str(),"kugou"|"kugou.exe") {
+        let native=kugou_control::seek(seconds);
+        music_log::state("酷狗跳转",if native{"本机接口可用"}else{"本机接口不可用，改用系统跳转"});
+        if native{return true;}
+    }
     let _apartment=init_winrt();
     use windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager as Manager;
     let session=media_result(Manager::RequestAsync).and_then(|mgr|mgr.GetSessions().ok())
         .and_then(|sessions|sessions.into_iter().find(|s|s.SourceAppUserModelId().ok().is_some_and(|id|id.to_string().eq_ignore_ascii_case(source))));
-    let native=source.eq_ignore_ascii_case("qqmusic.exe");
+    if apple_music::is_source(source){return session.as_ref().is_some_and(|session|seek_apple(session,source,seconds));}
+    let native=is_qqmusic(source);
     let timeline=||->Option<(f64,f64)>{
         let tl=session.as_ref()?.GetTimelineProperties().ok()?;
         Some((tl.Position().ok()?.Duration as f64/10_000_000.0,tl.EndTime().ok()?.Duration as f64/10_000_000.0))
@@ -465,16 +534,19 @@ pub fn seek(seconds:f64,source:&str)->bool {
     let target=if duration>0.0{seconds.min(duration)}else{seconds};
     let enabled=session.as_ref().and_then(|s|s.GetPlaybackInfo().ok()).and_then(|i|i.Controls().ok())
         .and_then(|c|c.IsPlaybackPositionEnabled().ok()).unwrap_or(false);
-    let paused_qq=source.eq_ignore_ascii_case("qqmusic.exe") && session.as_ref().and_then(|s|s.GetPlaybackInfo().ok())
+    let paused_qq=native && session.as_ref().and_then(|s|s.GetPlaybackInfo().ok())
         .and_then(|info|info.PlaybackStatus().ok()).is_some_and(|status|status!=windows::Media::Control::GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing);
     let accepted=(!native || enabled) && session.as_ref().and_then(|s|media_result(||s.TryChangePlaybackPositionAsync((target*10_000_000.0)as i64)))==Some(true);
     if !native{return accepted;}
-    for system in [true,false] {
-        if system {if !accepted{continue;}}else {
-            if !player_seek::seek(source,target,duration){return false;}
+    // 依次尝试：系统接口 → QQ 音乐自带的 /seekto 命令 → 点击界面进度条（旧版）。每一级都回读位置确认。
+    for stage in 0..3 {
+        match stage {
+            0=>{if !accepted{continue;}}
+            1=>{if !qq_seek_command(target){continue;}}
+            _=>{if !player_seek::seek(source,target,duration){return false;}}
         }
         let start=std::time::Instant::now();
-        let timeout=if system{Duration::from_millis(600)}else{Duration::from_secs(2)};
+        let timeout=match stage {0=>Duration::from_millis(600),1=>Duration::from_secs(3),_=>Duration::from_secs(2)};
         let mut pause_requested=false;
         while start.elapsed()<timeout {
             std::thread::sleep(Duration::from_millis(100));
@@ -493,6 +565,51 @@ pub fn seek(seconds:f64,source:&str)->bool {
         }
     }
     false
+}
+
+#[cfg(windows)]
+fn seek_apple(session:&windows::Media::Control::GlobalSystemMediaTransportControlsSession,source:&str,seconds:f64)->bool{
+    use windows::Media::Control::GlobalSystemMediaTransportControlsSessionPlaybackStatus as Status;
+    let status=||session.GetPlaybackInfo().ok()?.PlaybackStatus().ok();
+    let Some(before)=status()else{return false;};let paused=before!=Status::Playing;
+    let Some(duration)=session.GetTimelineProperties().ok().and_then(|tl|tl.EndTime().ok()).map(|time|time.Duration as f64/10_000_000.0)else{return false;};
+    if duration<=0.0{return false;}let target=seconds.min(duration);
+    let wait=|timeout:Duration,ready:&dyn Fn()->bool|{
+        let start=std::time::Instant::now();
+        loop{if ready(){return true;}if start.elapsed()>=timeout{return false;}std::thread::sleep(Duration::from_millis(100));}
+    };
+    let success=(||{
+        // Apple Music 暂停时忽略滑块设置；跳转完成后恢复原来的暂停状态。
+        if paused && (media_result(||session.TryPlayAsync())!=Some(true) || !wait(Duration::from_secs(2),&||status()==Some(Status::Playing))){return false;}
+        for attempt in 0..2 {
+            if !player_seek::seek(source,target,duration){return false;}
+            let start=std::time::Instant::now();
+            let timeout=if attempt==0{Duration::from_millis(500)}else{Duration::from_secs(2)};
+            if wait(timeout,&||session.GetTimelineProperties().ok().is_some_and(|tl|{
+                tl.EndTime().ok().is_some_and(|total|(total.Duration as f64/10_000_000.0-duration).abs()<1.5)
+                    && tl.Position().ok().is_some_and(|position|seek_arrived(position.Duration as f64/10_000_000.0,target,start.elapsed().as_secs_f64()))
+            })){return true;}
+        }
+        false
+    })();
+    if paused {
+        let mut accepted=media_result(||session.TryPauseAsync())==Some(true);
+        let start=std::time::Instant::now();let mut paused_at=None;let mut seen_pause=false;let mut retried=false;
+        // 原生滑块可能稍后再次续播，连续确认暂停后才结束；只补发一次暂停。
+        while start.elapsed()<Duration::from_secs(3){
+            let current=status();
+            if current==Some(Status::Paused){
+                seen_pause=true;let since=paused_at.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed()>=Duration::from_millis(500){return success && accepted;}
+            }else{
+                paused_at=None;
+                if current==Some(Status::Playing) && seen_pause && !retried{accepted&=media_result(||session.TryPauseAsync())==Some(true);retried=true;}
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        return false;
+    }
+    success
 }
 
 #[cfg(not(windows))]
@@ -645,9 +762,24 @@ impl MediaMemory {
 
 pub struct Poller {
     enabled:Arc<std::sync::atomic::AtomicBool>,stop:Arc<std::sync::atomic::AtomicBool>,worker:Option<std::thread::JoinHandle<()>>,
+    interval_ms:Arc<std::sync::atomic::AtomicU32>,
 }
+/// 看着音乐页或刚点过播放控制时的采样间隔，与改版前一致。
+pub const POLL_FAST:Duration=Duration::from_millis(250);
+/// 岛上收起显示歌词时：换歌、暂停最多晚半秒，歌词进度由本地时钟推算，不受影响。
+pub const POLL_LYRICS:Duration=Duration::from_millis(500);
+/// 其他时候只需跟上歌名和播放状态。
+pub const POLL_BACKGROUND:Duration=Duration::from_millis(1000);
+/// 没有任何播放器在放时，按请求间隔的 4 倍再放慢，限制在 1～2 秒。
+fn idle_interval(requested:u32)->u32{requested.saturating_mul(4).clamp(1000,2000)}
 impl Poller {
     pub fn store(&self,enabled:bool,order:std::sync::atomic::Ordering){self.enabled.store(enabled,order);}
+    /// 调整采样间隔；变快时立即唤醒采样线程补查一次，展开音乐页或点控制按钮后马上看到最新状态。
+    pub fn set_interval(&self,interval:Duration){
+        let ms=interval.as_millis().clamp(50,10_000) as u32;
+        let previous=self.interval_ms.swap(ms,std::sync::atomic::Ordering::Relaxed);
+        if ms<previous {if let Some(worker)=&self.worker{worker.thread().unpark();}}
+    }
 }
 impl Drop for Poller {
     fn drop(&mut self){
@@ -661,25 +793,35 @@ pub fn spawn_poller(state: Shared,ctx:eframe::egui::Context)->Poller {
     let enabled=Arc::new(std::sync::atomic::AtomicBool::new(true));
     let active=enabled.clone();
     let stop=Arc::new(std::sync::atomic::AtomicBool::new(false));let stopped=stop.clone();
+    let interval_ms=Arc::new(std::sync::atomic::AtomicU32::new(POLL_FAST.as_millis() as u32));let requested=interval_ms.clone();
     let worker=crate::resources::POLLER.spawn(move || {
         let _apartment=init_winrt();
         let mut artwork=ArtworkCache::default();
         let mut playback_clock=PlaybackClock::default();
         let mut memory=MediaMemory::default();
         let mut selected_source=String::new();
+        let mut volume=crate::music_volume::Reader::default();
         #[cfg(windows)]
         let mut netease=netease_playback::Reader::default();
+        #[cfg(windows)]
+        let mut bodian=bodian::Reader::default();
+        #[cfg(windows)]
+        let mut kuwo=kuwo::Reader::default();
+        #[cfg(windows)]
+        let mut cover_search=cover_search::CoverSearch::default();
+        #[cfg(windows)]
+        let mut gaps=music_gaps::Tracker::default();
         loop {
             if stopped.load(std::sync::atomic::Ordering::Acquire) || Arc::strong_count(&state)==1{break;}
             if !active.load(std::sync::atomic::Ordering::Relaxed){
                 artwork.clear(false);playback_clock=PlaybackClock::default();memory=MediaMemory::default();selected_source.clear();
-                #[cfg(windows)] {netease=netease_playback::Reader::default();}
+                #[cfg(windows)] {netease=netease_playback::Reader::default();bodian=bodian::Reader::default();kuwo=kuwo::Reader::default();}
                 if let Ok(mut current)=state.lock(){if !current.title.is_empty(){*current=NowPlaying::default();ctx.request_repaint();}}
                 std::thread::park_timeout(Duration::from_millis(250));continue;
             }
             let system=query(&mut artwork);
             #[cfg(windows)]
-            let native=netease.poll();
+            let native=netease.poll().into_iter().chain(bodian.poll()).chain(kuwo.poll()).min_by_key(media_rank);
             #[cfg(windows)]
             let native_pending=netease.pending();
             #[cfg(not(windows))]
@@ -688,29 +830,48 @@ pub fn spawn_poller(state: Shared,ctx:eframe::egui::Context)->Poller {
             let native_pending=false;
             let mut np=choose_media_for_source(system,native,&selected_source,native_pending).unwrap_or_default();
             memory.update(&mut np,std::time::Instant::now());
+            np.volume=volume.poll(&np.source);
             if !np.source.is_empty(){selected_source=np.source.clone();}
             #[cfg(windows)]
             netease.fill_artwork(&mut np);
+            // 播放器没给封面（缺系统缩略图、电台 / FM 等模式）时按歌名在线找一张。
+            #[cfg(windows)]
+            if np.artwork.is_none(){np.artwork=cover_search.fill(&np,std::time::Instant::now());}
             playback_clock.update(&mut np);
-            if np.title.is_empty() {
+            #[cfg(windows)]
+            if let Some(line)=gaps.observe(&np,std::time::Instant::now()){music_gaps::record(&line,&np.source);}
+            let idle=np.title.is_empty();
+            if idle {
                 artwork.clear(true);
             }
             if let Ok(mut cur) = state.lock() {
                 let changed=cur.title!=np.title || cur.artist!=np.artist || cur.playing!=np.playing
-                    || cur.source!=np.source || cur.song_id!=np.song_id || cur.duration!=np.duration
+                    || cur.source!=np.source || cur.song_id!=np.song_id || cur.duration!=np.duration || cur.volume!=np.volume
                     || cur.artwork.as_ref().zip(np.artwork.as_ref()).map_or(cur.artwork.is_some()!=np.artwork.is_some(),|(old,new)|!Arc::ptr_eq(old,new));
                 *cur = np;
                 if changed{ctx.request_repaint();}
             }
-            std::thread::park_timeout(Duration::from_millis(250));
+            let wait=requested.load(std::sync::atomic::Ordering::Relaxed);
+            std::thread::park_timeout(Duration::from_millis(if idle{idle_interval(wait)}else{wait}.into()));
         }
     });
-    Poller{enabled,stop,worker}
+    Poller{enabled,stop,worker,interval_ms}
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn qqmusic_is_recognised_by_old_and_new_session_names(){
+        for source in ["QQMusic.exe","qqmusic","Tencent.QQMusic"] {
+            assert!(is_qqmusic(source),"{source}");
+            let media=NowPlaying{title:"歌".into(),source:source.into(),playback_type:MediaKind::Music,..Default::default()};
+            assert!(media.is_music(),"{source} 应按音乐处理");
+        }
+        for source in ["Tencent.QQ","QQMusic.exe.bak","chrome.exe"] {assert!(!is_qqmusic(source),"{source}");}
+        #[cfg(windows)]
+        assert_eq!(music_log::player_exe("Tencent.QQMusic"),Some("QQMusic.exe"));
+    }
     #[test]
     #[cfg(windows)]
     fn resource_media_metadata_cannot_feed_unbounded_text_to_the_renderer(){
@@ -750,6 +911,26 @@ mod tests {
         while handled.lock().unwrap().len()<4 && std::time::Instant::now()<until{std::thread::sleep(Duration::from_millis(5));}
         assert_eq!(*handled.lock().unwrap(),vec![(Transport::Toggle,"QQMusic.exe".into()),(Transport::Seek(30.0),"QQMusic.exe".into()),(Transport::Seek(40.0),"Spotify.exe".into()),(Transport::Next,"QQMusic.exe".into())]);
         drop(worker);
+    }
+
+    #[test]
+    fn music_volume_queue_coalesces_only_the_same_players_volume_changes(){
+        let _serial=CONTROL_TESTS.lock().unwrap_or_else(|e|e.into_inner());wait_lane_idle(&crate::resources::CONTROL);
+        let (entered,started)=std::sync::mpsc::channel();let (release,wait)=std::sync::mpsc::channel::<()>();
+        let handled=Arc::new(Mutex::new(Vec::new()));let log=handled.clone();
+        let worker=ControlWorker::start_with(eframe::egui::Context::default(),move|command,source|{
+            if command==Transport::Toggle{let _=entered.send(());let _=wait.recv();}
+            log.lock().unwrap().push((command,source.to_string()));true
+        }).unwrap();
+        worker.submit(Transport::Toggle,"QQMusic.exe".into()).unwrap();started.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut results=Vec::new();
+        for (command,source) in [(Transport::SetVolume(10),"QQMusic.exe"),(Transport::SetVolume(20),"QQMusic.exe"),(Transport::SetVolume(30),"cloudmusic.exe"),(Transport::SetMute(true),"QQMusic.exe")]{
+            results.push(worker.submit(command,source.into()).unwrap().unwrap());
+        }
+        drop(release);
+        let outcomes:Vec<_>=results.iter().map(|rx|rx.recv_timeout(Duration::from_secs(2)).unwrap()).collect();
+        assert_eq!(outcomes,[false,true,true,true]);
+        assert_eq!(*handled.lock().unwrap(),vec![(Transport::Toggle,"QQMusic.exe".into()),(Transport::SetVolume(20),"QQMusic.exe".into()),(Transport::SetVolume(30),"cloudmusic.exe".into()),(Transport::SetMute(true),"QQMusic.exe".into())]);
     }
 
     #[test]
@@ -867,6 +1048,14 @@ mod tests {
     }
 
     #[test]
+    fn idle_sampling_slows_down_but_stays_within_two_seconds(){
+        assert_eq!(idle_interval(POLL_FAST.as_millis() as u32),1000);
+        assert_eq!(idle_interval(POLL_LYRICS.as_millis() as u32),2000);
+        assert_eq!(idle_interval(POLL_BACKGROUND.as_millis() as u32),2000);
+        assert_eq!(idle_interval(u32::MAX),2000);
+    }
+
+    #[test]
     #[ignore="需要本机存在媒体会话；只读验证关闭音乐页后停止采样、重新打开后恢复"]
     fn live_media_sampling_can_be_disabled_and_resumed(){
         let state=shared();let enabled=spawn_poller(state.clone(),eframe::egui::Context::default());
@@ -914,6 +1103,17 @@ mod tests {
     }
 
     #[test]
+    fn netease_song_id_survives_a_lead_artist_only_system_session(){
+        // #202：系统会话只报主艺人，网易云日志有完整署名和歌曲 ID；选系统会话时也要带上 ID，才能按 ID 取词。
+        let system=NowPlaying{source:"cloudmusic.exe".into(),title:"Loop".into(),artist:"雄之助".into(),playing:true,event_time_ms:Some(2),..Default::default()};
+        let native=NowPlaying{source:"cloudmusic.exe".into(),title:"Loop".into(),artist:"雄之助、WaMi".into(),playing:true,song_id:Some(1822506511),duration:185.0,event_time_ms:Some(1),..Default::default()};
+        let media=choose_media(Some(system.clone()),Some(native.clone())).unwrap();
+        assert_eq!((media.song_id,media.duration),(Some(1822506511),185.0));
+        let other=NowPlaying{artist:"RHYM".into(),..native};
+        assert_eq!(choose_media(Some(system),Some(other)).unwrap().song_id,None,"不同歌手的同名歌不能借用 ID");
+    }
+
+    #[test]
     fn native_cover_survives_a_missing_system_thumbnail(){
         let cover=Arc::new(eframe::egui::ColorImage::new([2,2],eframe::egui::Color32::BLUE));
         let native=NowPlaying{source:"cloudmusic.exe".into(),title:"歌曲".into(),artist:"歌手".into(),playing:true,artwork:Some(cover.clone()),..Default::default()};
@@ -947,6 +1147,16 @@ mod tests {
         assert!(choose_media(None,None).is_none(),"播放器全部退出后不能残留歌曲");
     }
 
+    #[test]
+    fn bodian_native_metadata_is_not_merged_into_a_netease_session(){
+        let system=NowPlaying{source:"cloudmusic.exe".into(),title:"同名歌曲".into(),artist:"歌手".into(),playing:true,..Default::default()};
+        let native=NowPlaying{source:"bodian_pc.exe".into(),song_id:Some(123),duration:240.0,..system.clone()};
+        let chosen=choose_media(Some(system.clone()),Some(native.clone())).unwrap();
+        assert_eq!(chosen.source,"cloudmusic.exe");assert_eq!(chosen.song_id,None);assert_eq!(chosen.duration,0.0);
+        let mut paused=system;paused.playing=false;
+        assert_eq!(choose_media(Some(paused),Some(native)).unwrap().source,"bodian_pc.exe");
+    }
+
     fn cover_bytes(color:eframe::egui::Color32)->Vec<u8> {
         let image=image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(2,2,image::Rgba(color.to_array())));
         let mut bytes=std::io::Cursor::new(Vec::new());
@@ -956,7 +1166,7 @@ mod tests {
 
     #[test]
     fn known_music_clients_accept_missing_artist_but_not_video(){
-        for source in ["kugou","QQMusic.exe","cloudmusic.exe","汽水音乐","SodaMusic.exe","Spotify.exe","kwmusic.exe"] {
+        for source in ["kugou","QQMusic.exe","cloudmusic.exe","汽水音乐","SodaMusic.exe","Spotify.exe","kwmusic.exe","bodian_pc.exe","AppleMusic.exe","AppleInc.AppleMusicWin_nzyj5cx40ttqa!App"] {
             let mut media=NowPlaying{source:source.into(),title:"歌曲".into(),playback_type:MediaKind::Music,..Default::default()};
             assert!(media.is_music(),"{source} 缺少歌手时仍应显示歌曲");
             media.playback_type=MediaKind::Video;assert!(!media.is_music());
@@ -1420,4 +1630,38 @@ mod tests {
             image::save_buffer(path,&pixels,cover.size[0] as u32,cover.size[1] as u32,image::ColorType::Rgba8).unwrap();
         }
     }
+}
+
+#[cfg(all(test,windows))]
+mod read_cost {
+    use super::*;
+    #[test]
+    #[ignore="本机实测：每一类读取在真实环境下每轮花多少时间（只读，不改播放状态）"]
+    fn live_read_cost_per_poll(){
+        let _apartment=init_winrt();
+        let mut artwork=ArtworkCache::default();
+        let mut netease=netease_playback::Reader::default();let mut bodian=bodian::Reader::default();let mut kuwo=kuwo::Reader::default();
+        let mut cost=[std::time::Duration::ZERO;4];let rounds=40;
+        let mut last=None;
+        for _ in 0..rounds {
+            let t=std::time::Instant::now();last=query(&mut artwork);cost[0]+=t.elapsed();
+            let t=std::time::Instant::now();let _=netease.poll();cost[1]+=t.elapsed();
+            let t=std::time::Instant::now();let _=bodian.poll();cost[2]+=t.elapsed();
+            let t=std::time::Instant::now();let _=kuwo.poll();cost[3]+=t.elapsed();
+            std::thread::sleep(POLL_FAST);
+        }
+        let media=last.unwrap_or_default();
+        println!("当前：{} · {} 时长{:.1}",media.source,media.title,media.duration);
+        for (name,total) in ["系统会话(含酷狗/网易云补全)","网易云日志","波点","酷我"].iter().zip(cost){println!("{name}: 平均 {:?}/轮",total/rounds);}
+    }
+}
+#[cfg(all(test,windows))]
+#[test]
+#[ignore="本机实测：一次进程快照、一次波点/酷我发现各要多久"]
+fn live_discovery_cost(){
+    let t=std::time::Instant::now();for _ in 0..20{let _=player_process::pids_named("bodian_pc.exe");}println!("进程快照: {:?}/次",t.elapsed()/20);
+    let t=std::time::Instant::now();let n=netease_timeline::kugou_position();println!("酷狗进度(含首次发现): {:?} {:?}",t.elapsed(),n);
+    let t=std::time::Instant::now();for _ in 0..20{let _=netease_timeline::kugou_position();}println!("酷狗进度: {:?}/次",t.elapsed()/20);
+    let mut cache=kugou_metadata::Cache::default();
+    let t=std::time::Instant::now();for _ in 0..20{let _=cache.get("x","y",false);}println!("酷狗窗口核对: {:?}/次",t.elapsed()/20);
 }

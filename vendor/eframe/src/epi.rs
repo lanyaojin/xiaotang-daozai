@@ -622,6 +622,9 @@ impl std::str::FromStr for Renderer {
 /// It provides methods to inspect the surroundings (are we on the web?),
 /// access to persistent storage, and access to the rendering backend.
 pub struct Frame {
+    /// 原生交互截图已按应用指定的时刻开始这一帧，后续限帧沿用同一起点。
+    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+    pub interactive_frame_start: Option<std::time::Instant>,
     /// Information about the integration.
     pub(crate) info: IntegrationInfo,
 
@@ -678,6 +681,8 @@ impl Frame {
     #[doc(hidden)]
     pub fn _new_kittest() -> Self {
         Self {
+            #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+            interactive_frame_start: None,
             #[cfg(feature = "glow")]
             gl: None,
             #[cfg(all(feature = "glow", not(target_arch = "wasm32")))]

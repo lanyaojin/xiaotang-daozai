@@ -15,3 +15,5 @@
 Thumbs.db
 # WorkBuddy 本地会话数据（自动化记忆等），不进入仓库
 /.workbuddy/
+/编译并测试-Claude.cmd
+/编译测试版-Claude.cmd

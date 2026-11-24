@@ -6,6 +6,8 @@ use base64::Engine;
 pub(crate) mod grok;
 #[path="gemini_quota.rs"]
 pub(crate) mod gemini;
+#[path="doubao_quota.rs"]
+pub(crate) mod doubao;
 #[path="claude_quota.rs"]
 mod claude;
 #[path="workbuddy_quota.rs"]
@@ -14,6 +16,14 @@ pub(crate) mod workbuddy;
 pub(crate) mod deepseek;
 #[path="zcode_quota.rs"]
 pub(crate) mod zcode;
+#[path="plan_quota.rs"]
+pub(crate) mod plans;
+#[path="relay_quota.rs"]
+pub(crate) mod relay;
+#[path="api_quota.rs"]
+pub(crate) mod api;
+#[path="kiro_quota.rs"]
+pub(crate) mod kiro;
 #[path="native_auth.rs"]
 mod native_auth;
 
@@ -26,12 +36,14 @@ impl Discovery {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Provider { #[default] Codex, Claude, Kimi, GrokBot, Gemini, ZCode, WorkBuddy, DeepSeek }
+pub enum Provider { #[default] Codex, Claude, Kimi, GrokBot, Gemini, ZCode, WorkBuddy, DeepSeek, OpenCodeGo, MiniMax, Glm, NewApi, OneApi, Sub2Api, Kiro, Doubao, RelayGeneral, RelayCustom }
 impl Provider {
-    pub const ALL: [Self; 8] = [Self::Codex, Self::Claude, Self::Kimi, Self::GrokBot, Self::Gemini, Self::ZCode, Self::WorkBuddy, Self::DeepSeek];
-    pub fn name(self) -> &'static str { match self {Self::Codex=>"Codex",Self::Claude=>"Claude",Self::Kimi=>"Kimi",Self::GrokBot=>"Grok Bot",Self::Gemini=>"Gemini",Self::ZCode=>"ZCode",Self::WorkBuddy=>"WorkBuddy",Self::DeepSeek=>"DeepSeek"} }
-    pub fn balance(self)->bool{matches!(self,Self::WorkBuddy|Self::DeepSeek)}
-    fn parse(s: &str) -> Option<Self> {if s.eq_ignore_ascii_case("grokbot"){return Some(Self::GrokBot);}Self::ALL.into_iter().find(|p|p.name().eq_ignore_ascii_case(s))}
+    pub const ALL: [Self; 18] = [Self::Codex, Self::Claude, Self::Kimi, Self::GrokBot, Self::Gemini, Self::ZCode, Self::WorkBuddy, Self::DeepSeek, Self::OpenCodeGo, Self::MiniMax, Self::Glm, Self::NewApi, Self::OneApi, Self::Sub2Api, Self::Kiro, Self::Doubao, Self::RelayGeneral, Self::RelayCustom];
+    pub fn name(self) -> &'static str { match self {Self::Codex=>"Codex",Self::Claude=>"Claude",Self::Kimi=>"Kimi",Self::GrokBot=>"Grok Bot",Self::Gemini=>"Gemini",Self::ZCode=>"ZCode",Self::WorkBuddy=>"WorkBuddy",Self::DeepSeek=>"DeepSeek",Self::OpenCodeGo=>"OpenCode Go",Self::MiniMax=>"MiniMax",Self::Glm=>"GLM",Self::NewApi=>"New API",Self::OneApi=>"One API",Self::Sub2Api=>"Sub2API",Self::Kiro=>"Kiro",Self::Doubao=>"豆包",Self::RelayGeneral=>"通用余额",Self::RelayCustom=>"自定义查询"} }
+    pub fn api_key(self)->bool{matches!(self,Self::OpenCodeGo|Self::MiniMax|Self::Glm)||self.relay()}
+    pub fn relay(self)->bool{matches!(self,Self::NewApi|Self::OneApi|Self::Sub2Api|Self::RelayGeneral|Self::RelayCustom)}
+    pub fn balance(self)->bool{matches!(self,Self::WorkBuddy|Self::DeepSeek)||self.relay()}
+    fn parse(s: &str) -> Option<Self> {if s.eq_ignore_ascii_case("grokbot"){return Some(Self::GrokBot);}if s.eq_ignore_ascii_case("doubao"){return Some(Self::Doubao);}Self::ALL.into_iter().find(|p|p.name().eq_ignore_ascii_case(s))}
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Accent { #[default] Brand, Violet, Orange, Blue, Cyan, Pink, Gold, Green }
@@ -60,15 +72,20 @@ impl Config {
         Self{enabled:v["enabled"].as_bool().unwrap_or(true),compact:v["compact"].as_bool().unwrap_or(true),selected:v["selected"].as_str().unwrap_or_default().into(),accounts,colors}
     }
     fn json(&self)->Value {let colors:serde_json::Map<String,Value>=self.colors.iter().map(|(id,color)|(id.clone(),json!(color.key()))).collect();json!({"enabled":self.enabled,"compact":self.compact,"selected":self.selected,"colors":colors,"accounts":self.accounts.iter().map(|a|json!({"id":a.id,"provider":a.provider.name(),"alias":a.alias,"source":a.source,"slot":a.slot,"enabled":a.enabled,"pinned":a.pinned})).collect::<Vec<_>>()})}
-    pub fn save(&self) {
-        let dir=crate::model::config_dir();let _=fs::create_dir_all(&dir);
-        if let Ok(raw)=serde_json::to_vec_pretty(&self.json()){let _=crate::model::atomic_write(&dir.join("ai-quota.json"),&raw);}
+    pub fn save(&self) {let _=self.save_checked();}
+    pub(crate) fn save_checked(&self)->Result<(),String>{
+        let dir=crate::model::config_dir();fs::create_dir_all(&dir).map_err(|_|"无法创建额度配置目录")?;
+        let raw=serde_json::to_vec_pretty(&self.json()).map_err(|_|"无法生成额度配置")?;
+        crate::model::atomic_write(&dir.join("ai-quota.json"),&raw).map_err(|_|"无法保存额度配置，原账号未变更".into())
     }
     pub fn add(&mut self,provider:Provider,alias:String,source:PathBuf)->Result<(),String>{
+        if provider.api_key(){return Err("请使用 API Key 连接，无需登录 JSON".into());}
         if provider==Provider::ZCode{return zcode::add(self,&source,&alias);}
+        if provider==Provider::Kiro{return kiro::add(self,&source,&alias);}
         if provider==Provider::WorkBuddy{return Err("请使用浏览器连接 WorkBuddy".into());}
         if provider==Provider::DeepSeek{return Err("请使用 API Key 连接 DeepSeek".into());}
         if provider==Provider::Gemini{return Err("请使用浏览器或 Cookie 连接 Gemini 网页账号".into());}
+        if provider==Provider::Doubao{return Err("请使用浏览器或 Cookie 连接豆包网页账号".into());}
         if provider==Provider::GrokBot{return self.import_grok(&source,&alias).map(|_|());}
         if provider==Provider::Claude{return self.import_claude(&source,&alias).map(|_|());}
         if !source.is_file(){return Err("请选择已有的登录 JSON 文件".into());}
@@ -137,7 +154,7 @@ impl Config {
     }
     pub fn discover(&mut self)->Discovery {
         let home=std::env::var_os("USERPROFILE").or_else(||std::env::var_os("HOME")).map(PathBuf::from).unwrap_or_default();
-        let mut candidates=vec![(Provider::Codex,home.join(".codex/auth.json")),(Provider::Claude,claude::code_path()),(Provider::Kimi,home.join(".kimi/credentials/kimi-code.json")),(Provider::Kimi,home.join(".kimi-code/credentials/kimi-code.json"))];
+        let mut candidates=vec![(Provider::Codex,home.join(".codex/auth.json")),(Provider::Claude,claude::code_path()),(Provider::Kimi,home.join(".kimi/credentials/kimi-code.json")),(Provider::Kimi,home.join(".kimi-code/credentials/kimi-code.json")),(Provider::Kiro,home.join(".aws/sso/cache/kiro-auth-token.json"))];
         if let Some(dir)=std::env::var_os("CODEX_HOME").filter(|s|!s.is_empty()){candidates.push((Provider::Codex,PathBuf::from(dir).join("auth.json")));}
         candidates.extend(self.accounts.iter().filter(|a|matches!(a.provider,Provider::Codex|Provider::Kimi)||(a.provider==Provider::Claude&&a.slot.is_none())).map(|a|(a.provider,a.source.clone())));
         let before=self.accounts.len();
@@ -155,6 +172,11 @@ impl Config {
         let mut notes=Vec::new();
         for (provider,path) in candidates.iter().filter(|(_,p)|p.is_file()){
             if *provider==Provider::Claude{if let Err(error)=self.import_claude(path,""){notes.push(error);}continue;}
+            if *provider==Provider::Kiro{
+                let source=fs::canonicalize(path).unwrap_or_else(|_|path.clone());
+                if !self.accounts.iter().any(|a|a.provider==Provider::Kiro&&a.source==source){if let Err(e)=kiro::add(self,path,""){notes.push(e);}}
+                continue;
+            }
             let auth=match credentials(*provider,path){Ok(auth)=>auth,Err(error)=>{notes.push(format!("{}：{error}",provider.name()));continue;}};
             if let Some(existing)=self.accounts.iter_mut().filter(|a|a.provider==*provider).find(|a|account_credentials(a).is_ok_and(|old|same_login(&old,&auth))){
                 if auth.stamp>fs::metadata(&existing.source).and_then(|m|m.modified()).ok(){existing.source=fs::canonicalize(path).unwrap_or_else(|_|path.clone());}
@@ -185,10 +207,30 @@ impl Config {
 }
 #[derive(Clone, Debug, PartialEq)]
 #[derive(serde::Serialize,serde::Deserialize)]
-pub struct Window {pub label:String,pub seconds:Option<i64>,pub remaining:f32,pub reset:Option<i64>}
+pub struct Window {pub label:String,pub seconds:Option<i64>,pub remaining:f32,pub reset:Option<i64>,
+    /// 积分型额度的具体数值（例如 Kiro 的点数）；有值时界面显示数值而不是百分比。
+    #[serde(default)]pub amount:Option<Amount>}
+/// 周期额度的绝对数值：剩余量与总额。百分比仍然用于绘制进度，数值用于文字。
+#[derive(Clone, Debug, PartialEq)]
+#[derive(serde::Serialize,serde::Deserialize)]
+pub struct Amount {pub remaining:f64,pub limit:f64}
+impl Amount {
+    pub fn new(remaining:f64,limit:f64)->Self{let limit=limit.max(0.0);Self{remaining:remaining.clamp(0.0,limit),limit}}
+    /// 常驻栏剩余点数：三位数以上取整。
+    pub fn short(&self)->String{if self.remaining>=100.0{format!("{:.0}",self.remaining)}else{number_text(self.remaining)}}
+    /// 列表与提示里的完整写法：剩余 / 总额。
+    pub fn full(&self)->String{format!("{} / {}",number_text(self.remaining),number_text(self.limit))}
+}
+fn number_text(v:f64)->String{let digits=if v<1.0{2}else{1};let factor=10f64.powi(digits);let rounded=(v*factor).round()/factor;if rounded>=1000.0||rounded.fract()==0.0{format!("{rounded:.0}")}else{format!("{rounded:.digits$}",digits=digits as usize)}}
+impl Window {
+    /// 剩余量的书面写法：数值型额度给出“剩余 / 总额”，其余给出百分比。
+    pub fn value_text(&self)->String{self.amount.as_ref().map(Amount::full).unwrap_or_else(||format!("{:.0}%",self.remaining))}
+    /// 一句话额度摘要，用于小岛提示与设置页。
+    pub fn summary(&self)->String{format!("{}剩余 {}",self.label,self.value_text())}
+}
 #[derive(Clone, Debug, Default)]
 #[derive(serde::Serialize,serde::Deserialize)]
-pub struct Snapshot {pub plan:String,pub windows:Vec<Window>,pub extra:Vec<Window>,pub at:i64,pub wallet:Option<deepseek::Wallet>,pub credits:Option<workbuddy::Credits>}
+pub struct Snapshot {#[serde(default)]pub kiro:Option<kiro::Details>,pub plan:String,pub windows:Vec<Window>,pub extra:Vec<Window>,pub at:i64,pub wallet:Option<deepseek::Wallet>,pub credits:Option<workbuddy::Credits>,#[serde(default)] pub relay:Option<relay::Quota>}
 impl Account {
     pub(crate) fn cache_identity_marker(&self)->Value {
         if claude::is_desktop(&self.source){json!(2)}else{json!(true)}
@@ -196,8 +238,10 @@ impl Account {
     pub(crate) fn cached_snapshot(&self,cache:&Value)->Option<Snapshot>{
         let entry=&cache[&self.id];
         if entry["provider"].as_str()!=Some(self.provider.name()) || entry["slot"].as_str()!=self.slot.as_deref(){return None;}
+        if self.provider.api_key() && entry["source"].as_str()!=self.source.to_str(){return None;}
         if self.provider==Provider::Claude && (entry["source"].as_str()!=self.source.to_str() || entry["local_identity_checked"]!=self.cache_identity_marker()){return None;}
         let snapshot:Snapshot=serde_json::from_value(entry["snapshot"].clone()).ok()?;
+        if self.provider==Provider::Kiro && (self.slot.is_none()||entry["source"].as_str()!=self.source.to_str()||kiro::check_owner(self,&snapshot).is_err()){return None;}
         (snapshot.at>0 && !snapshot.wallet.as_ref().is_some_and(|w|w.balances.is_empty())).then_some(snapshot)
     }
 }
@@ -209,13 +253,16 @@ fn reset(v:&Value)->Option<i64>{v.as_i64().filter(|n|*n>0).or_else(||chrono::Dat
 fn cadence(seconds:Option<i64>)->String{match seconds{Some(18000)=>"5 小时".into(),Some(604800)=>"本周".into(),Some(86400)=>"今日".into(),Some(s)if s>0 && s%86400==0=>format!("{} 天",s/86400),Some(s)if s>0 && s%3600==0=>format!("{} 小时",s/3600),Some(s)if s>0=>format!("{} 分钟",s/60),_=>"额度周期".into()}}
 fn codex_window(v:&Value)->Option<Window>{
     let used=number(&v["used_percent"])?;let seconds=v["limit_window_seconds"].as_i64().filter(|s|*s>0);
-    Some(Window{label:cadence(seconds),seconds,remaining:(100.0-used).clamp(0.0,100.0) as f32,reset:reset(&v["reset_at"])})
+    Some(Window{label:cadence(seconds),seconds,remaining:(100.0-used).clamp(0.0,100.0) as f32,reset:reset(&v["reset_at"]),amount:None})
 }
 pub fn parse(provider:Provider,v:&Value)->Result<Snapshot,String>{
+    if provider.api_key(){return Err("请使用对应服务的地区及协议解析额度".into());}
     if provider==Provider::WorkBuddy{return workbuddy::parse(v);}
     if provider==Provider::DeepSeek{return deepseek::parse(v);}
     if provider==Provider::GrokBot{return grok::parse(v);}
     if provider==Provider::Gemini{return gemini::parse(v);}
+    if provider==Provider::Kiro{return kiro::parse(v);}
+    if provider==Provider::Doubao{return doubao::parse(v);}
     let mut s=Snapshot{plan:v["plan_type"].as_str().unwrap_or_default().into(),at:chrono::Utc::now().timestamp(),..Default::default()};
     match provider {
         Provider::Codex=>{
@@ -226,29 +273,30 @@ pub fn parse(provider:Provider,v:&Value)->Result<Snapshot,String>{
             }
         }
         Provider::Claude=>{
-            for(key,seconds)in [("five_hour",18000),("seven_day",604800)]{if let Some(used)=number(&v[key]["utilization"]){s.windows.push(Window{label:cadence(Some(seconds)),seconds:Some(seconds),remaining:(100.0-used).clamp(0.0,100.0) as f32,reset:reset(&v[key]["resets_at"])});}}
+            for(key,seconds)in [("five_hour",18000),("seven_day",604800)]{if let Some(used)=number(&v[key]["utilization"]){s.windows.push(Window{label:cadence(Some(seconds)),seconds:Some(seconds),remaining:(100.0-used).clamp(0.0,100.0) as f32,reset:reset(&v[key]["resets_at"]),amount:None});}}
         }
         Provider::Kimi=>{
             if let Some(usages)=v["usages"].as_object(){
                 for (key,label,seconds) in [("limit_5h","5 小时",Some(18000)),("limit_7d","本周",Some(604800)),("limit_month_total","本月总额度",None),("limit_month_code","本月编程",None)]{
                     let Some(entry)=usages.get(key) else{continue;};
                     let Some(used)=number(&entry["used_ratio"]).filter(|n|(0.0..=1.0).contains(n)) else{continue;};
-                    s.windows.push(Window{label:label.into(),seconds,remaining:((1.0-used)*100.0) as f32,reset:reset(&entry["reset_time"])});
+                    s.windows.push(Window{label:label.into(),seconds,remaining:((1.0-used)*100.0) as f32,reset:reset(&entry["reset_time"]),amount:None});
                 }
                 if !s.windows.is_empty(){return Ok(s);}
             }
             if v.as_object().is_some_and(|o|o.is_empty()){return Err("Kimi 已登录，官网暂未返回周期额度".into());}
-            let section=|v:&Value,seconds:Option<i64>|->Option<Window>{let limit=number(&v["limit"])?;if limit<=0.0{return None;}let remaining=number(&v["remaining"]).or_else(||Some(limit-number(&v["used"])?))?;Some(Window{label:cadence(seconds),seconds,remaining:(remaining/limit*100.0).clamp(0.0,100.0) as f32,reset:reset(&v["resetTime"])})};
+            let section=|v:&Value,seconds:Option<i64>|->Option<Window>{let limit=number(&v["limit"])?;if limit<=0.0{return None;}let remaining=number(&v["remaining"]).or_else(||Some(limit-number(&v["used"])?))?;Some(Window{label:cadence(seconds),seconds,remaining:(remaining/limit*100.0).clamp(0.0,100.0) as f32,reset:reset(&v["resetTime"]),amount:None})};
             if let Some(w)=section(&v["usage"],Some(604800)){s.windows.push(w);}
             for limit in v["limits"].as_array().into_iter().flatten(){let duration=limit["window"]["duration"].as_i64();let unit=limit["window"]["timeUnit"].as_str().unwrap_or_default();let factor=match unit{"TIME_UNIT_MINUTE"=>Some(60),"TIME_UNIT_HOUR"=>Some(3600),"TIME_UNIT_DAY"=>Some(86400),"TIME_UNIT_SECOND"=>Some(1),_=>None};let seconds=duration.zip(factor).and_then(|(d,f)|d.checked_mul(f));if let Some(w)=section(&limit["detail"],seconds){if !s.windows.iter().any(|old|old.seconds==w.seconds){s.windows.push(w);}}}
         }
-        Provider::ZCode|Provider::GrokBot|Provider::Gemini|Provider::WorkBuddy|Provider::DeepSeek=>unreachable!(),
+        _=>unreachable!(),
     }
     if s.windows.is_empty(){return Err("服务未提供周期额度，暂不绘制进度".into());}
     s.windows.sort_by_key(|w|w.seconds.unwrap_or(i64::MAX));Ok(s)
 }
 
-struct Credential {token:String,account_id:Option<String>,identity:Option<String>,stamp:Option<std::time::SystemTime>}
+pub const KIMI_RELOGIN:&str="登录已失效，请在 Kimi Code 重新登录";
+struct Credential {token:String,account_id:Option<String>,identity:Option<String>,expires_at:Option<f64>,stamp:Option<std::time::SystemTime>}
 fn same_login(a:&Credential,b:&Credential)->bool{a.token==b.token||a.identity.as_ref().zip(b.identity.as_ref()).is_some_and(|(a,b)|a==b)}
 fn login_json(path:&Path)->Result<Value,String>{
     let raw=fs::read(path).map_err(|_|"无法读取登录文件".to_string())?;
@@ -258,65 +306,89 @@ fn account_credentials(account:&Account)->Result<Credential,String>{
     credentials(account.provider,&account.source)
 }
 fn credentials(provider:Provider,path:&Path)->Result<Credential,String>{
+    if provider.api_key(){return Err("API Key 账号不读取登录文件".into());}
     if provider==Provider::Claude{return Err("Claude 仅使用本地用量记录，不读取登录令牌".into());}
     let root=login_json(path)?;
     let v=if provider==Provider::Codex{root.get("auth_json").unwrap_or(&root)}else{&root};
-    let token=match provider{Provider::Codex=>v.pointer("/tokens/access_token").or_else(||v.get("access_token")),Provider::Kimi=>v.get("access_token"),Provider::Claude|Provider::ZCode|Provider::GrokBot|Provider::Gemini|Provider::WorkBuddy|Provider::DeepSeek=>None}.and_then(Value::as_str).filter(|s|!s.trim().is_empty()).ok_or("未找到订阅账号的登录凭据，请选择对应工具的登录文件")?.to_owned();
+    let token=match provider{Provider::Codex=>v.pointer("/tokens/access_token").or_else(||v.get("access_token")),Provider::Kimi=>v.get("access_token"),_=>None}.and_then(Value::as_str).filter(|s|!s.trim().is_empty()).ok_or("未找到订阅账号的登录凭据，请选择对应工具的登录文件")?.to_owned();
     let claims=token.split('.').nth(1).and_then(|b|base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(b).ok()).and_then(|b|serde_json::from_slice::<Value>(&b).ok()).unwrap_or(Value::Null);
     let account_id=v.pointer("/tokens/account_id").or_else(||v.get("account_id")).and_then(Value::as_str).or_else(||claims.pointer("/https:~1~1api.openai.com~1auth/chatgpt_account_id").and_then(Value::as_str)).filter(|s|!s.is_empty()).map(str::to_owned);
     let identity=match provider{
         Provider::Codex=>account_id.as_ref().zip(claims.pointer("/https:~1~1api.openai.com~1auth/chatgpt_user_id").or_else(||claims.get("sub")).and_then(Value::as_str).filter(|s|!s.is_empty())).map(|(account,user)|format!("{account}:{user}")),
         Provider::Kimi=>claims.get("user_id").or_else(||claims.get("sub")).and_then(Value::as_str).filter(|s|!s.is_empty()).map(str::to_owned),
+        Provider::Kiro=>v.get("profileArn").and_then(Value::as_str).filter(|s|!s.is_empty()).map(str::to_owned),
         _=>None,
     };
-    Ok(Credential{token,account_id,identity,stamp:fs::metadata(path).and_then(|m|m.modified()).ok()})
+    let expires_at=if provider==Provider::Kimi {
+        number(&v["expires_at"]).filter(|at|*at!=0.0).or_else(||number(&claims["exp"]))
+    }else{None};
+    Ok(Credential{token,account_id,identity,expires_at,stamp:fs::metadata(path).and_then(|m|m.modified()).ok()})
 }
 pub struct Event {pub id:String,pub result:Result<Snapshot,String>}
+#[derive(Default)]
+struct Pending {accounts:Option<Vec<Account>>,running:bool,cooldowns:HashMap<(String,Option<String>,PathBuf),(Instant,String)>}
+type PendingAccounts = std::sync::Arc<std::sync::Mutex<Pending>>;
+fn service_group(provider:Provider)->usize{match provider{Provider::DeepSeek=>1,Provider::WorkBuddy=>2,Provider::OpenCodeGo=>3,Provider::MiniMax=>4,Provider::Glm=>5,Provider::NewApi|Provider::RelayGeneral|Provider::RelayCustom=>6,Provider::OneApi=>7,Provider::Sub2Api=>8,Provider::Kiro=>9,_=>0}}
+struct Worker {pending:PendingAccounts,wake:mpsc::SyncSender<()>}
 pub struct Service {
-    tx:mpsc::SyncSender<Vec<Account>>,
+    workers:HashMap<usize,Worker>,
+    results:mpsc::Sender<(Account,Result<Snapshot,String>)>,
     rx:mpsc::Receiver<(Account,Result<Snapshot,String>)>,
 }
 impl Service {
-    pub fn start()->Self{
-        let(tx,requests)=mpsc::sync_channel::<Vec<Account>>(1);
-        let(results,rx)=mpsc::channel();
-        std::thread::spawn(move||{
-            let mut cooldowns:HashMap<_,(Instant,String)>=HashMap::new();
-            while let Ok(accounts)=requests.recv(){
-                let agent=http_agent();
-                let mut groups=[Vec::new(),Vec::new(),Vec::new()];
-                for a in accounts.into_iter().filter(|a|a.enabled){
-                    let key=(a.id.clone(),a.slot.clone(),a.source.clone());
-                    if let Some((until,message))=cooldowns.get(&key){
-                        if *until>Instant::now(){let _=results.send((a,Err(message.clone())));continue;}
-                    }
-                    let group=match a.provider{Provider::DeepSeek=>1,Provider::WorkBuddy=>2,_=>0};
-                    groups[group].push((key,a));
+    pub fn start()->Self{let(results,rx)=mpsc::channel();Self{workers:HashMap::new(),results,rx}}
+    pub fn refresh(&mut self,accounts:Vec<Account>)->bool{self.refresh_with(accounts,fetch)}
+    fn refresh_with(&mut self,accounts:Vec<Account>,run:impl Fn(&ureq::Agent,&Account)->Result<Snapshot,(String,u64)>+Clone+Send+'static)->bool{
+        let mut groups:Vec<Vec<Account>>=(0..10).map(|_|Vec::new()).collect();
+        for account in accounts.into_iter().filter(|account|account.enabled){groups[service_group(account.provider)].push(account);}
+        for (group,accounts) in groups.into_iter().enumerate(){
+            if let Some(worker)=self.workers.get(&group){
+                let Ok(mut pending)=worker.pending.lock()else{return false;};
+                if pending.running {
+                    pending.accounts=Some(accounts);
+                    if matches!(worker.wake.try_send(()),Err(mpsc::TrySendError::Disconnected(_))){return false;}
+                    continue;
                 }
-                cooldowns.retain(|_,(until,_)|*until>Instant::now());
-                // 同一浏览器会话内串行查询，两个余额服务各自独立完成。
-                std::thread::scope(|scope|{
-                    let mut workers=Vec::new();
-                    for group in groups.into_iter().filter(|g|!g.is_empty()){
-                        let agent=&agent;let results=&results;
-                        workers.push(scope.spawn(move||{
-                            let mut waits=Vec::new();
-                            for (key,a) in group{
-                                let result=fetch(agent,&a);
-                                if let Err((message,wait))=&result{
-                                    if *wait>0 {waits.push((key,(Instant::now()+Duration::from_secs(*wait),message.clone())));}
-                                }
-                                let _=results.send((a,result.map_err(|e|e.0)));
-                            }
-                            waits
-                        }));
-                    }
-                    for worker in workers{if let Ok(waits)=worker.join(){cooldowns.extend(waits);}}
-                });
             }
-        });Self{tx,rx}
+            if accounts.is_empty(){continue;}
+            // 停用后保留退避记录，重新启用时仍尊重服务器的限流时间。
+            let pending=self.workers.get(&group).map(|worker|worker.pending.clone()).unwrap_or_default();
+            {let Ok(mut next)=pending.lock()else{return false;};next.accounts=Some(accounts);next.running=true;}
+            let next=pending.clone();let results=self.results.clone();let run=run.clone();
+            let(wake,requests)=mpsc::sync_channel::<()>(1);
+            let spawned=std::thread::Builder::new().name("daozai-quota".into()).spawn(move||{
+                while requests.recv().is_ok(){
+                    let accounts={
+                        let Ok(mut state)=next.lock()else{break;};
+                        let Some(accounts)=state.accounts.take()else{continue;};
+                        if accounts.is_empty(){state.running=false;return;}
+                        state.cooldowns.retain(|_,(until,_)|*until>Instant::now());accounts
+                    };
+                    let agent=http_agent();
+                    for account in accounts {
+                        let key=(account.id.clone(),account.slot.clone(),account.source.clone());
+                        let cooldown={
+                            let Ok(state)=next.lock()else{break;};
+                            if state.accounts.as_ref().is_some_and(Vec::is_empty){break;}
+                            state.cooldowns.get(&key).filter(|(until,_)|*until>Instant::now()).map(|(_,message)|message.clone())
+                        };
+                        if let Some(message)=cooldown{if results.send((account,Err(message))).is_err(){return;}continue;}
+                        let result=run(&agent,&account);
+                        if let Err((message,wait))=&result{if *wait>0{
+                            if let Ok(mut state)=next.lock(){state.cooldowns.insert(key,(Instant::now()+Duration::from_secs((*wait).min(3600)),message.clone()));}
+                        }}
+                        if results.send((account,result.map_err(|e|e.0))).is_err(){return;}
+                    }
+                }
+                if let Ok(mut state)=next.lock(){state.running=false;}
+            });
+            if spawned.is_err(){if let Ok(mut state)=pending.lock(){state.running=false;}return false;}
+            self.workers.insert(group,Worker{pending,wake});
+            // 信号与最新请求合并；关闭时只等在途请求，不积累新的线程。
+            let _=self.workers[&group].wake.try_send(());
+        }
+        true
     }
-    pub fn refresh(&self,accounts:Vec<Account>)->bool{self.tx.try_send(accounts).is_ok()}
     pub fn try_recv(&self,config:&Config)->Option<Event>{
         while let Ok((source,result))=self.rx.try_recv(){
             if config.enabled && config.accounts.iter().any(|a|a.enabled&&a.id==source.id&&a.provider==source.provider&&a.source==source.source&&a.slot==source.slot){
@@ -327,7 +399,10 @@ impl Service {
     }
 }
 fn http_agent()->ureq::Agent{
-    let mut builder=ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).redirects(0);
+    http_agent_with_connect_timeout(Duration::from_secs(30))
+}
+fn http_agent_with_connect_timeout(timeout:Duration)->ureq::Agent{
+    let mut builder=ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).timeout_connect(timeout).redirects(0);
     let proxy=["HTTPS_PROXY","https_proxy","ALL_PROXY","all_proxy","HTTP_PROXY","http_proxy"].iter().find_map(|key|std::env::var(key).ok().filter(|s|!s.is_empty())).or_else(system_proxy);
     if let Some(proxy)=proxy.and_then(|s|ureq::Proxy::new(s).ok()){builder=builder.proxy(proxy);}
     builder.build()
@@ -344,17 +419,34 @@ fn http_agent()->ureq::Agent{
     if server.is_empty(){None}else if server.contains("://"){Some(server.into())}else{Some(format!("http://{server}"))}
 }
 fn fetch(agent:&ureq::Agent,account:&Account)->Result<Snapshot,(String,u64)>{
+    if account.provider.api_key(){return api::fetch(agent,account);}
     if account.provider==Provider::Claude{return claude::fetch(account).map_err(|e|(e,0));}
     if account.provider==Provider::ZCode{return zcode::fetch(agent,account).map_err(|e|(e,60));}
     if account.provider==Provider::WorkBuddy{return workbuddy::fetch(agent,account);}
     if account.provider==Provider::DeepSeek{return deepseek::fetch(agent,account);}
     if account.provider==Provider::GrokBot{return grok::fetch(agent,account);}
     if account.provider==Provider::Gemini{return gemini::fetch(agent,account);}
+    if account.provider==Provider::Kiro{return kiro::fetch(agent,account);}
+    if account.provider==Provider::Doubao{return doubao::fetch(agent,account);}
+    let url=match account.provider{Provider::Codex=>"https://chatgpt.com/backend-api/wham/usage",Provider::Kimi=>"https://api.kimi.com/coding/v1/usages",_=>unreachable!()};
+    fetch_subscription_at(agent,account,url)
+}
+fn fetch_subscription_at(agent:&ureq::Agent,account:&Account,url:&str)->Result<Snapshot,(String,u64)>{
     let auth=account_credentials(account).map_err(|e|(e,0))?;
-    let url=match account.provider{Provider::Codex=>"https://chatgpt.com/backend-api/wham/usage",Provider::Kimi=>"https://api.kimi.com/coding/v1/usages",Provider::Claude|Provider::ZCode|Provider::GrokBot|Provider::Gemini|Provider::WorkBuddy|Provider::DeepSeek=>unreachable!()};
-    let mut req=agent.get(url).set("Authorization",&format!("Bearer {}",auth.token)).set("Accept","application/json").set("User-Agent","codex-cli/Daozai");
+    if auth.expires_at.is_some_and(|at|at<=chrono::Utc::now().timestamp_millis() as f64/1000.0){
+        return Err((KIMI_RELOGIN.into(),0));
+    }
+    let user_agent=if account.provider==Provider::Kimi{concat!("Daozai/",env!("CARGO_PKG_VERSION"))}else{"codex-cli/Daozai"};
+    let mut req=agent.get(url).set("Authorization",&format!("Bearer {}",auth.token)).set("Accept","application/json").set("User-Agent",user_agent);
     if account.provider==Provider::Codex{if let Some(id)=&auth.account_id{req=req.set("ChatGPT-Account-Id",id);}}
-    let response=req.call().map_err(|e|match e{ureq::Error::Status(401|403,_)=>("登录已失效或权限不足，请在对应工具中重新登录".into(),0),ureq::Error::Status(429,r)=>("请求过于频繁，稍后自动重试".into(),r.header("Retry-After").and_then(|s|s.parse().ok()).unwrap_or(180).clamp(30,3600)),ureq::Error::Status(n,_)=>(format!("额度服务暂不可用（{n}）"),60),_=>("无法连接额度服务，请检查网络或代理".into(),30)})?;
+    let response=req.call().map_err(|e|match e{
+        ureq::Error::Status(401,_) if account.provider==Provider::Kimi=>(KIMI_RELOGIN.into(),0),
+        ureq::Error::Status(403,_) if account.provider==Provider::Kimi=>("当前账号没有查询 Kimi Code 订阅额度的权限".into(),0),
+        ureq::Error::Status(401|403,_)=>("登录已失效或权限不足，请在对应工具中重新登录".into(),0),
+        ureq::Error::Status(429,r)=>("请求过于频繁，稍后自动重试".into(),r.header("Retry-After").and_then(|s|s.parse().ok()).unwrap_or(180).clamp(30,3600)),
+        ureq::Error::Status(n,_)=>(format!("额度服务暂不可用（{n}）"),60),
+        _=>("无法连接额度服务，请检查网络或代理".into(),30),
+    })?;
     let mut body=String::new();response.into_reader().take(1024*1024).read_to_string(&mut body).map_err(|_|("读取额度响应失败".into(),30))?;
     if auth.stamp!=fs::metadata(&account.source).and_then(|m|m.modified()).ok(){return Err(("登录信息已变化，请刷新额度".into(),0));}
     let value=serde_json::from_str(&body).map_err(|_|("服务没有返回有效的额度数据".into(),60))?;
@@ -363,6 +455,118 @@ fn fetch(agent:&ureq::Agent,account:&Account)->Result<Snapshot,(String,u64)>{
 
 #[cfg(test)] mod tests {
     use super::*;
+    #[test]
+    fn kimi_expired_login_recovers_on_the_next_poll() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        let path=std::env::temp_dir().join(format!("daozai-kimi-expiry-{}.json",std::process::id()));
+        let expired=json!({"access_token":"old-fixture","expires_at":1234.75}).to_string();
+        fs::write(&path,&expired).unwrap();
+        let mut config=Config::default();
+        config.add(Provider::Kimi,"测试".into(),path.clone()).unwrap();
+        let account=&config.accounts[0];
+        let agent=ureq::AgentBuilder::new().timeout(Duration::from_secs(1)).build();
+        let server=TcpListener::bind("127.0.0.1:0").unwrap();
+        let url=format!("http://{}/usage",server.local_addr().unwrap());
+        let (message,wait)=fetch_subscription_at(&agent,account,&url).unwrap_err();
+        assert!(message.contains("Kimi Code") && message.contains("重新登录"));
+        assert_eq!(wait,0);
+        server.set_nonblocking(true).unwrap();
+        assert_eq!(server.accept().unwrap_err().kind(),std::io::ErrorKind::WouldBlock,"过期凭据不应发出请求");
+        server.set_nonblocking(false).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(),expired);
+
+        let responder=std::thread::spawn(move||{
+            for status in ["401 Unauthorized","403 Forbidden","429 Too Many Requests","200 OK"]{
+                let (mut stream,_)=server.accept().unwrap();
+                let reader=BufReader::new(stream.try_clone().unwrap());
+                let headers:Vec<_>=reader.lines().map(Result::unwrap).take_while(|line|!line.is_empty()).map(|line|line.to_ascii_lowercase()).collect();
+                let body=r#"{"usages":{"limit_5h":{"used_ratio":0.25}}}"#;
+                write!(stream,"HTTP/1.1 {status}\r\nRetry-After: 77\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+                if status=="200 OK"{
+                    assert!(headers.iter().any(|h|h=="authorization: bearer renewed-fixture"));
+                    assert!(headers.iter().any(|h|h==concat!("user-agent: daozai/",env!("CARGO_PKG_VERSION"))));
+                }
+            }
+        });
+        fs::write(&path,r#"{"access_token":"legacy-fixture"}"#).unwrap();
+        assert_eq!(fetch_subscription_at(&agent,account,&url).unwrap_err(),(KIMI_RELOGIN.into(),0));
+        fs::write(&path,r#"{"access_token":"legacy-fixture","expires_at":0}"#).unwrap();
+        assert!(fetch_subscription_at(&agent,account,&url).unwrap_err().0.contains("权限"));
+        assert_eq!(fetch_subscription_at(&agent,account,&url).unwrap_err().1,77);
+
+        let renewed=json!({"access_token":"renewed-fixture","expires_at":chrono::Utc::now().timestamp()+900}).to_string();
+        fs::write(&path,&renewed).unwrap();
+        let snapshot=fetch_subscription_at(&agent,account,&url).unwrap();
+        assert_eq!(snapshot.rings()[0].remaining,75.0);
+        responder.join().unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(),renewed);
+        fs::remove_file(path).unwrap();
+    }
+    #[test] fn lightweight_quota_startup_has_no_unused_workers(){
+        let mut service=Service::start();assert!(service.workers.is_empty(),"未启用额度来源时不应创建后台线程");
+        assert!(service.refresh(vec![]));assert!(service.workers.is_empty());
+    }
+    #[test] fn api_cache_is_bound_to_endpoint_region_and_credential(){
+        let mut account=Account{id:"api-fixture".into(),provider:Provider::MiniMax,alias:"fixture".into(),source:"cn".into(),slot:Some("opaque".into()),enabled:true,pinned:false};
+        let cache=json!({"api-fixture":{"provider":"MiniMax","source":"cn","slot":"opaque","snapshot":Snapshot{at:1900000000,..Default::default()}}});
+        assert!(account.cached_snapshot(&cache).is_some());
+        account.source="global".into();assert!(account.cached_snapshot(&cache).is_none());
+        account.source="cn".into();account.slot=Some("new-key".into());assert!(account.cached_snapshot(&cache).is_none());
+    }
+    #[test] fn old_snapshot_without_relay_field_still_deserializes(){
+        let old=json!({"plan":"pro","windows":[],"extra":[],"at":1900000000,"wallet":null,"credits":null});
+        assert!(serde_json::from_value::<Snapshot>(old).unwrap().relay.is_none());
+    }
+    #[test] fn provider_queues_coalesce_without_cross_provider_waits(){
+        let(tx,wake)=mpsc::sync_channel(1);let pending=PendingAccounts::default();
+        pending.lock().unwrap().running=true;
+        let(results,rx)=mpsc::channel();let group=service_group(Provider::NewApi);
+        let mut service=Service{workers:HashMap::from([(group,Worker{pending:pending.clone(),wake:tx})]),results,rx};
+        let a=Account{id:"old".into(),provider:Provider::NewApi,alias:String::new(),source:"https://relay.example".into(),slot:Some("fixture".into()),enabled:true,pinned:false};
+        assert!(service.refresh(vec![a.clone()]));let mut newer=a;newer.id="new".into();
+        assert!(service.refresh(vec![newer]));
+        assert_eq!(pending.lock().unwrap().accounts.as_ref().unwrap()[0].id,"new");
+        assert_eq!(service.workers.len(),1);assert!(wake.try_recv().is_ok());assert!(wake.try_recv().is_err());
+    }
+    #[test] fn enabled_quota_groups_run_independently_and_reuse_inflight_workers(){
+        use std::sync::{Arc,Mutex};
+        let account=|id:&str,provider,enabled|Account{id:id.into(),provider,alias:String::new(),source:PathBuf::new(),slot:None,enabled,pinned:false};
+        let(started,events)=mpsc::channel();let(release,blocked)=mpsc::channel();let blocked=Arc::new(Mutex::new(blocked));
+        let run=move|_:&ureq::Agent,a:&Account|{started.send(a.id.clone()).unwrap();if a.id=="slow"{blocked.lock().unwrap().recv_timeout(Duration::from_secs(3)).unwrap();}Ok(Snapshot::default())};
+        let slow=account("slow",Provider::NewApi,true);let fast=account("fast",Provider::OpenCodeGo,true);
+        let mut service=Service::start();assert!(service.refresh_with(vec![slow.clone(),fast,account("disabled",Provider::Glm,false)],run.clone()));
+        let mut first=[events.recv_timeout(Duration::from_secs(2)).unwrap(),events.recv_timeout(Duration::from_secs(2)).unwrap()];first.sort();assert_eq!(first,["fast","slow"]);
+        let group=service_group(Provider::NewApi);let original=service.workers[&group].pending.clone();assert_eq!(service.workers.len(),2);
+        let mut outdated=slow.clone();outdated.id="outdated".into();assert!(service.refresh_with(vec![outdated],run.clone()));
+        assert!(service.refresh_with(vec![],run.clone()));
+        let mut resumed=slow;resumed.id="resumed".into();assert!(service.refresh_with(vec![resumed],run.clone()));
+        assert!(Arc::ptr_eq(&original,&service.workers[&group].pending),"在途线程应直接复用，不能随开关切换叠加");
+        release.send(()).unwrap();assert_eq!(events.recv_timeout(Duration::from_secs(2)).unwrap(),"resumed");
+        assert!(service.refresh_with(vec![],run));
+        let deadline=Instant::now()+Duration::from_secs(2);
+        while service.workers.values().any(|worker|worker.pending.lock().unwrap().running)&&Instant::now()<deadline{std::thread::sleep(Duration::from_millis(2));}
+        assert!(service.workers.values().all(|worker|!worker.pending.lock().unwrap().running));assert!(events.try_recv().is_err());
+    }
+    #[test] fn stopped_quota_workers_keep_server_backoff_when_reenabled(){
+        let mut service=Service::start();let group=service_group(Provider::NewApi);let pending=PendingAccounts::default();
+        let account=Account{id:"limited".into(),provider:Provider::NewApi,alias:String::new(),source:PathBuf::new(),slot:None,enabled:true,pinned:false};
+        pending.lock().unwrap().cooldowns.insert((account.id.clone(),None,PathBuf::new()),(Instant::now()+Duration::from_secs(60),"限流中".into()));
+        let(wake,_)=mpsc::sync_channel(1);service.workers.insert(group,Worker{pending:pending.clone(),wake});
+        assert!(service.refresh_with(vec![account.clone()],|_,_|panic!("退避期间不能重新发请求")));
+        let c=Config{accounts:vec![account],..Config::default()};let deadline=Instant::now()+Duration::from_secs(2);let mut received=None;
+        while Instant::now()<deadline{if let Some(event)=service.try_recv(&c){received=Some(event.result);break;}std::thread::sleep(Duration::from_millis(2));}
+        assert_eq!(received.unwrap().unwrap_err(),"限流中");assert!(std::sync::Arc::ptr_eq(&pending,&service.workers[&group].pending));
+    }
+    #[test] fn late_result_from_replaced_key_is_discarded(){
+        let mut c=Config::default();let a=Account{id:"same".into(),provider:Provider::Glm,alias:String::new(),source:"cn".into(),slot:Some("old".into()),enabled:true,pinned:false};
+        let mut current=a.clone();current.slot=Some("new".into());c.accounts.push(current.clone());
+        let(tx,rx)=mpsc::channel();let service=Service{workers:HashMap::new(),results:tx.clone(),rx};
+        tx.send((a,Ok(Snapshot::default()))).unwrap();tx.send((current,Err("current response".into()))).unwrap();
+        let event=service.try_recv(&c).unwrap();assert_eq!(event.result.unwrap_err(),"current response");assert!(service.try_recv(&c).is_none());
+    }
+
     #[test]
     fn claude_local_config_ignores_retired_reset_fields(){
         let current=json!({"enabled":true,"compact":false,"selected":"desktop","colors":{"desktop":"blue"},"accounts":[{"id":"desktop","provider":"Claude","alias":"离线账号","source":"fixture/config.json","slot":"first","enabled":true,"pinned":true}]});

@@ -143,16 +143,30 @@ pub fn preview(text: &str) -> String {
 
 // ---------------------------------------------------------------- Windows 监听
 
+/// 剪贴板监听的持有者；销毁时让监听线程退出并注销系统监听，不等待线程结束。
+pub struct Watcher {
+    #[cfg(windows)]
+    stop: Arc<win::Stop>,
+}
+
 #[cfg(windows)]
-pub fn watch(shared: Shared, repaint: impl Fn() + Send + 'static) {
+impl Drop for Watcher {
+    fn drop(&mut self) { self.stop.request(); }
+}
+
+#[cfg(windows)]
+pub fn watch(shared: Shared, repaint: impl Fn() + Send + 'static) -> Option<Watcher> {
+    let stop = Arc::new(win::Stop::default());
+    let thread_stop = stop.clone();
     std::thread::Builder::new().name("daozai-clipboard".into()).spawn(move || {
         // 启动失败（极少见）时剪贴板页只是没有新记录，不影响其他功能。
-        let _ = win::run(shared, Box::new(repaint));
-    }).ok();
+        let _ = win::run(shared, Box::new(repaint), &thread_stop);
+    }).ok()?;
+    Some(Watcher { stop })
 }
 
 #[cfg(not(windows))]
-pub fn watch(_shared: Shared, _repaint: impl Fn() + Send + 'static) {}
+pub fn watch(_shared: Shared, _repaint: impl Fn() + Send + 'static) -> Option<Watcher> { Some(Watcher {}) }
 
 #[cfg(windows)]
 const HISTORY_COPY_FORMAT: &str = "Daozai.ClipboardHistoryCopy";
@@ -180,6 +194,23 @@ mod win {
     const WM_CLIPBOARDUPDATE: u32 = 0x031D;
 
     struct State { shared: Shared, repaint: Box<dyn Fn() + Send> }
+
+    /// 监听线程建好消息窗口后登记线程号；持有者销毁时先置位再读线程号，两边总有一方看到对方。
+    #[derive(Default)]
+    pub struct Stop { requested: std::sync::atomic::AtomicBool, thread: std::sync::atomic::AtomicU32 }
+    impl Stop {
+        pub fn request(&self) {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.requested.store(true, SeqCst);
+            let thread = self.thread.load(SeqCst);
+            if thread != 0 { unsafe { let _ = PostThreadMessageW(thread, WM_QUIT, WPARAM(0), LPARAM(0)); } }
+        }
+        fn register(&self) -> bool {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.thread.store(unsafe { windows::Win32::System::Threading::GetCurrentThreadId() }, SeqCst);
+            !self.requested.load(SeqCst)
+        }
+    }
     thread_local! { static STATE: RefCell<Option<State>> = const { RefCell::new(None) }; }
 
     unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -245,13 +276,15 @@ mod win {
         text
     }
 
-    pub fn run(shared: Shared, repaint: Box<dyn Fn() + Send>) -> windows::core::Result<()> {
+    pub fn run(shared: Shared, repaint: Box<dyn Fn() + Send>, stop: &Stop) -> windows::core::Result<()> {
         unsafe {
             let instance = GetModuleHandleW(None)?;
             let class = w!("DaozaiClipboardWatcher");
             let wc = WNDCLASSW { lpfnWndProc: Some(proc), hInstance: instance.into(), lpszClassName: class, ..Default::default() };
             RegisterClassW(&wc);
             let hwnd = CreateWindowExW(WINDOW_EX_STYLE(0), class, PCWSTR::null(), WINDOW_STYLE(0), 0, 0, 0, 0, HWND_MESSAGE, None, instance, None)?;
+            // 消息窗口建好后线程已有消息队列，此后投递的 WM_QUIT 不会丢。
+            if !stop.register() { let _ = DestroyWindow(hwnd); return Ok(()); }
             STATE.with(|state| *state.borrow_mut() = Some(State { shared, repaint }));
             AddClipboardFormatListener(hwnd)?;
             let mut msg = MSG::default();
@@ -260,6 +293,8 @@ mod win {
                 DispatchMessageW(&msg);
             }
             let _ = RemoveClipboardFormatListener(hwnd);
+            let _ = DestroyWindow(hwnd);
+            STATE.with(|state| *state.borrow_mut() = None);
         }
         Ok(())
     }
@@ -268,6 +303,21 @@ mod win {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn dropping_the_watcher_ends_the_listener_thread(){
+        // 先停后启和启动后再停两种顺序都必须让线程退出，不能留下常驻的监听窗口。
+        for stop_first in [true,false] {
+            let stop=Arc::new(win::Stop::default());let thread_stop=stop.clone();
+            let shared=Shared{history:Default::default(),enabled:Arc::new(AtomicBool::new(false))};
+            if stop_first {stop.request();}
+            let (done,finished)=std::sync::mpsc::channel();
+            std::thread::spawn(move||{let _=win::run(shared,Box::new(||{}),&thread_stop);let _=done.send(());});
+            if !stop_first {std::thread::sleep(std::time::Duration::from_millis(200));stop.request();}
+            finished.recv_timeout(std::time::Duration::from_secs(3)).expect("监听线程应在停止后退出");
+        }
+    }
 
     #[test]
     fn history_copy_preserves_order_but_external_copy_promotes() {

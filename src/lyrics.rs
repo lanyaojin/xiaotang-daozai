@@ -42,8 +42,16 @@ pub(crate) fn romanized(track:&str,lyrics:&Lyrics)->bool {
 }
 
 fn negative_path(path:&std::path::Path)->std::path::PathBuf {path.with_extension("none")}
+thread_local!{static SKIP_NEGATIVE:std::cell::Cell<bool>=const{std::cell::Cell::new(false)};}
+/// 用户手动点「重试」时，本线程的这次查询跳过「近期已确认没有歌词」的记录，真正重新联网。
+/// 查询结束（含提前返回）后自动恢复，不影响之后的自动查询。
+struct SkipNegative(bool);
+impl SkipNegative {fn set(on:bool)->Self {Self(SKIP_NEGATIVE.with(|skip|skip.replace(on)))}}
+impl Drop for SkipNegative {fn drop(&mut self){SKIP_NEGATIVE.with(|skip|skip.set(self.0));}}
+
 fn read_negative(path:&std::path::Path)->Option<Result<Lyrics,FetchError>> {
     use std::io::Read;
+    if SKIP_NEGATIVE.with(|skip|skip.get()){trace(||"手动重试:跳过无歌词记录".into());return None;}
     let path=negative_path(path);
     let file=std::fs::File::open(&path).ok()?;
     let meta=file.metadata().ok()?;
@@ -171,22 +179,51 @@ pub(crate) fn native_fingerprint(source:&str)->Option<(std::time::SystemTime,u64
 }
 
 pub(crate) fn read_native(source:&str,track:&str,artist:&str,duration:f64)->Option<Lyrics> {
-    if source.to_ascii_lowercase().contains("kugou") {return kugou_cache::read(track,artist,duration);}
+    read_native_detail(source,track,artist,duration).ok()
+}
+
+/// 本地缓存读取；未命中时给出原因，供诊断日志使用。
+pub(crate) fn read_native_detail(source:&str,track:&str,artist:&str,duration:f64)->Result<Lyrics,&'static str> {
+    if source.to_ascii_lowercase().contains("kugou") {return kugou_cache::read(track,artist,duration).ok_or("未命中");}
     if is_soda(source) {
-        let lyrics=parse_krc(&soda_cache::read(track,artist,duration)?);
-        return lyrics.synced.then_some(lyrics);
+        let lyrics=parse_krc(&soda_cache::read_detail(track,artist,duration).map_err(|miss|miss.label())?);
+        return if lyrics.synced {Ok(lyrics)}else{Err("缓存歌词无时间轴")};
     }
-    None
+    Err("不支持本地读取")
+}
+
+/// 后台本地轮询（客户端稍后才写好歌词）的结果单独记一行，命中或放弃时各写一次。
+pub(crate) fn log_native(source:&str,track:&str,artist:&str,outcome:&str,elapsed:std::time::Duration) {
+    if cfg!(test) {return;}
+    let line=format!("{} {source} · {track} - {artist} → 本地轮询:{outcome} 用时{}ms\n",
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),elapsed.as_millis());
+    crate::resources::append_log(&crate::model::config_dir().join("diagnostics"),"lyrics.log",&line);
 }
 
 /// 返回歌词及是否仍需等待酷狗缓存；等待期间复用已有歌词，不重复访问在线服务。
 pub fn fetch_for_display(source:&str,track:&str,artist:&str,duration:f64,song_id:Option<u64>,cached:Option<Lyrics>)->Result<(Lyrics,bool),FetchError>{
+    fetch_for_display_with(source,track,artist,duration,song_id,cached,false)
+}
+
+/// `manual`：用户手动重试，跳过近期「没有歌词」的记录。网络失败仍不会被记成没有歌词。
+pub fn fetch_for_display_with(source:&str,track:&str,artist:&str,duration:f64,song_id:Option<u64>,cached:Option<Lyrics>,manual:bool)->Result<(Lyrics,bool),FetchError>{
     take_trace();
+    let _skip=SkipNegative::set(manual);
     let started=std::time::Instant::now();
     let result=(||{
         if source.to_ascii_lowercase().contains("kugou"){
             if let Some(lyrics)=kugou_cache::read(track,artist,duration){trace(||"酷狗本地:命中".into());return Ok((lyrics,false));}
             trace(||"酷狗本地:无".into());
+            return cached.map(Ok).unwrap_or_else(||fetch(track,artist,duration)).map(|lyrics|(lyrics,true));
+        }
+        #[cfg(windows)]
+        if source.eq_ignore_ascii_case("bodian_pc.exe") {
+            if let Some(lyrics)=song_id.and_then(crate::smtc::bodian::read_lyrics){trace(||"波点本地:命中".into());return Ok((lyrics,false));}
+            return cached.map(Ok).unwrap_or_else(||fetch(track,artist,duration)).map(|lyrics|(lyrics,true));
+        }
+        #[cfg(windows)]
+        if source.eq_ignore_ascii_case("kwmusic.exe") {
+            if let Some(lyrics)=crate::smtc::kuwo::read_lyrics(track,artist){trace(||"酷我本地:命中".into());return Ok((lyrics,false));}
             return cached.map(Ok).unwrap_or_else(||fetch(track,artist,duration)).map(|lyrics|(lyrics,true));
         }
         fetch_for_source(source,track,artist,duration,song_id).map(|lyrics|(lyrics,false))
@@ -203,6 +240,14 @@ pub fn fetch_for_display(source:&str,track:&str,artist:&str,duration:f64,song_id
 
 /// 原生缓存优先；未缓存的新歌仍可使用已有在线来源。
 pub fn fetch_for_source(source:&str,track:&str,artist:&str,duration:f64,song_id:Option<u64>)->Result<Lyrics,FetchError> {
+    #[cfg(windows)]
+    if source.eq_ignore_ascii_case("kwmusic.exe") {
+        if let Some(lyrics)=crate::smtc::kuwo::read_lyrics(track,artist){trace(||"酷我本地:命中".into());return Ok(lyrics);}
+    }
+    #[cfg(windows)]
+    if source.eq_ignore_ascii_case("bodian_pc.exe") {
+        if let Some(lyrics)=song_id.and_then(crate::smtc::bodian::read_lyrics){trace(||"波点本地:命中".into());return Ok(lyrics);}
+    }
     if source.to_ascii_lowercase().contains("qqmusic") {
         let common=cache_path(track,artist,duration);
         let path=common.parent().unwrap().join("qqmusic").join(common.file_name().unwrap());
@@ -246,9 +291,13 @@ pub fn fetch_for_source(source:&str,track:&str,artist:&str,duration:f64,song_id:
         }
     }
     if is_soda(source) {
-        if let Some(raw)=soda_cache::read(track,artist,duration) {
-            let lyrics=parse_krc(&raw);
-            if lyrics.synced {return Ok(lyrics);}
+        match soda_cache::read_detail(track,artist,duration) {
+            Ok(raw)=>{
+                let lyrics=parse_krc(&raw);
+                if lyrics.synced {trace(||"汽水本地:命中".into());return Ok(lyrics);}
+                trace(||"汽水本地:无时间轴".into());
+            }
+            Err(miss)=>trace(||format!("汽水本地:{}",miss.label())),
         }
     }
     fetch(track,artist,duration)
@@ -342,9 +391,55 @@ fn fetch_with_sources(netease:Option<&str>,qq:Option<&str>,lrclib:Option<&str>,t
     fetch_with_sources_detail(netease,qq,lrclib,track,artist,duration).0
 }
 
+/// 电台、DJ、部分网页播放器把「歌名 - 歌手」整个放进标题、歌手栏留空：拆成两半，只拆唯一的一个分隔符。
+pub(crate) fn split_title_artist(title:&str)->Option<(String,String)> {
+    for separator in [" - "," – "," — "] {
+        if title.matches(separator).count()!=1 {continue;}
+        let (left,right)=title.split_once(separator)?;
+        let (left,right)=(left.trim(),right.trim());
+        if !left.is_empty() && !right.is_empty() {return Some((left.to_owned(),right.to_owned()));}
+    }
+    None
+}
+
+/// 去掉开头的节目标注（【电台】、[DJ]）和结尾的版本标注（(DJ版)、（伴奏）、【现场】），只留歌名本体。
+pub(crate) fn bare_title(title:&str)->String {
+    static LEADING:std::sync::OnceLock<regex::Regex>=std::sync::OnceLock::new();
+    static TRAILING:std::sync::OnceLock<regex::Regex>=std::sync::OnceLock::new();
+    let leading=LEADING.get_or_init(||regex::Regex::new(r"^\s*(?:【[^】]*】|\[[^\]]*\])\s*").unwrap());
+    let trailing=TRAILING.get_or_init(||regex::Regex::new(r"\s*(?:\([^()]*\)|（[^（）]*）|\[[^\]]*\]|【[^】]*】)\s*$").unwrap());
+    let mut text=title.trim().to_owned();
+    loop {
+        let next=trailing.replace(&leading.replace(&text,""),"").trim().to_owned();
+        if next==text || next.is_empty() {return text;}
+        text=next;
+    }
+}
+
+/// 在线找词：先按播放器给的歌名、歌手找；落空时再按两种兜底各试一次——
+/// 歌手为空时从标题里拆出歌手（两种顺序），以及去掉节目 / 版本标注（只在有时长时，靠时长校验避免套错版本）。
+/// 有来源断网或限流时不再追加尝试，免得一首歌放大成多倍请求。
+fn fetch_with_sources_detail(netease:Option<&str>,qq:Option<&str>,lrclib:Option<&str>,track:&str,artist:&str,duration:f64)->(Result<Lyrics,FetchError>,bool) {
+    let mut attempts=vec![(track.to_owned(),artist.to_owned())];
+    if artist.trim().is_empty() {
+        if let Some((left,right))=split_title_artist(track) {attempts.push((left.clone(),right.clone()));attempts.push((right,left));}
+    }
+    let bare=bare_title(track);
+    if duration>0.0 && bare!=track.trim() {attempts.push((bare,artist.to_owned()));}
+    let mut best:Option<Result<Lyrics,FetchError>>=None;
+    for (index,(title,singer)) in attempts.into_iter().enumerate() {
+        if index>0 {trace(||format!("兜底:{title} - {}",if singer.is_empty(){"（无歌手）"}else{&singer}));}
+        let (result,failed)=fetch_with_sources_once(netease,qq,lrclib,&title,&singer,duration);
+        if failed || result.as_ref().is_ok_and(|lyrics|lyrics.synced) {return (result,failed);}
+        // 纯文本先留着，继续找同步版本；都没有时用第一份纯文本。
+        if best.as_ref().is_none_or(|kept|kept.is_err() && result.is_ok()) {best=Some(result);}
+    }
+    (best.unwrap_or(Err(FetchError::NotFound)),false)
+}
+
 /// 按顺序尝试，命中同步歌词立即停止；全部只有纯文本时取第一个，网络类错误优先于「未找到」上报以便重试。
 /// 第二个返回值表示是否有来源失败（断网、限流、响应异常），这时结果不能当作「确认没有」缓存。
-fn fetch_with_sources_detail(netease:Option<&str>,qq:Option<&str>,lrclib:Option<&str>,track:&str,artist:&str,duration:f64)->(Result<Lyrics,FetchError>,bool) {
+fn fetch_with_sources_once(netease:Option<&str>,qq:Option<&str>,lrclib:Option<&str>,track:&str,artist:&str,duration:f64)->(Result<Lyrics,FetchError>,bool) {
     let mut plain=None;
     let mut transliterated=None;
     let mut failure=None;
@@ -379,6 +474,16 @@ pub(crate) fn same_song(title:&str,artist:&str,other_title:&str,other_artist:&st
     !a.0.is_empty() && a.0==b.0 && (a.1.is_empty() || b.1.is_empty() || a.1==b.1)
 }
 
+/// 同一会话里前后两次歌曲信息的关系：`Some(true)` 同一首（歌手相同或一方为空），
+/// `Some(false)` 同一首但署名有补全（如单人署名补全为合唱），`None` 不同歌曲。
+pub(crate) fn song_relation(title:&str,artist:&str,other_title:&str,other_artist:&str)->Option<bool> {
+    if same_song(title,artist,other_title,other_artist){return Some(true);}
+    let (a,b)=(song_identity(title,artist),song_identity(other_title,other_artist));
+    if a.0.is_empty() || a.0!=b.0 {return None;}
+    let within=|x:&[String],y:&[String]|x.iter().all(|s|y.contains(s));
+    (within(&a.1,&b.1) || within(&b.1,&a.1)).then_some(false)
+}
+
 fn normalized(text:&str)->String {
     text.chars().flat_map(char::to_lowercase).filter(|c|c.is_alphanumeric()).collect()
 }
@@ -410,10 +515,21 @@ fn search_terms(track:&str,artist:&str)->(String,String) {
     (split_feature(&clean_title(track)).0.to_owned(),split_feature(artist).0.to_owned())
 }
 
+/// 候选的歌名和歌手是否对得上。`lead_only` 为假时要求歌手集合完全相同；
+/// 为真时是严格匹配落空后的第二轮：播放器（如网易云的系统媒体会话）常只上报主艺人，
+/// 播放侧只有一位歌手、歌名不含 feat 时，允许候选为包含这位主艺人的合唱署名（#202）。
+fn credit_match(played:&(String,Vec<String>),track:&str,candidate:&(String,Vec<String>),lead_only:bool)->bool {
+    if played.1.is_empty() || played.0!=candidate.0 {return false;}
+    if !lead_only {return played.1==candidate.1;}
+    played.1.len()==1 && split_feature(&clean_title(track)).1.is_empty() && candidate.1.contains(&played.1[0])
+}
+
 fn netease_candidates(items:&[serde_json::Value],track:&str,artist:&str,duration:f64)->Vec<u64> {
     let title=normalized(track);
     let identity=song_identity(track,artist);
     let mut matches=Vec::new();
+    for lead_only in [false,true] {
+    if !matches.is_empty() {break;}
     for item in items {
         let Some(id)=item.get("id").and_then(|v|v.as_u64()) else{continue;};
         let name=item.get("name").and_then(|v|v.as_str()).unwrap_or_default();
@@ -421,11 +537,12 @@ fn netease_candidates(items:&[serde_json::Value],track:&str,artist:&str,duration
         let artists=item.get("artists").or_else(||item.get("ar")).and_then(|v|v.as_array());
         let Some(artists)=artists else{continue;};
         let names=artists.iter().filter_map(|a|a.get("name")?.as_str()).collect::<Vec<_>>().join("、");
-        if identity.1.is_empty() || song_identity(name,&names)!=identity{continue;}
+        if !credit_match(&identity,track,&song_identity(name,&names),lead_only){continue;}
         let candidate_duration=item.get("duration").or_else(||item.get("dt")).and_then(|v|v.as_f64()).unwrap_or_default()/1000.0;
         let difference=if duration>0.0 {(candidate_duration-duration).abs()}else{0.0};
         if duration>0.0 && difference>(duration*0.03).max(10.0){continue;}
         matches.push((id,!exact,difference));
+    }
     }
     matches.sort_by(|a,b|a.1.cmp(&b.1).then(a.2.total_cmp(&b.2)));
     matches.into_iter().map(|(id,_,_)|id).take(3).collect()
@@ -560,12 +677,18 @@ fn fetch_from(base:&str,track:&str,artist:&str,duration_secs:f64)->Result<Lyrics
     let identity=song_identity(track,artist);
     let (query_title,query_artist)=search_terms(track,artist);
     let items=search(base,&query_title,&query_artist)?;
-    let items=items.into_iter().filter(|item|{
+    lyrics_from_items(&lrclib_matches(items,track,&identity),track,duration_secs)
+}
+
+/// LRCLIB 候选：先要求歌手完全相同，没有时再允许「播放器只报主艺人」的合唱署名。
+fn lrclib_matches(items:Vec<serde_json::Value>,track:&str,identity:&(String,Vec<String>))->Vec<serde_json::Value> {
+    let pick=|lead_only|items.iter().filter(|item|{
         let name=item.get("trackName").and_then(|v|v.as_str()).unwrap_or_default();
         let singer=item.get("artistName").and_then(|v|v.as_str()).unwrap_or_default();
-        !identity.1.is_empty() && song_identity(name,singer)==identity
-    }).collect::<Vec<_>>();
-    lyrics_from_items(&items,track,duration_secs)
+        credit_match(identity,track,&song_identity(name,singer),lead_only)
+    }).cloned().collect::<Vec<_>>();
+    let strict=pick(false);
+    if strict.is_empty(){pick(true)}else{strict}
 }
 
 fn search(base:&str,track:&str,artist:&str)->Result<Vec<serde_json::Value>,FetchError> {
@@ -614,6 +737,17 @@ fn urlencode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn radio_style_titles_are_split_and_stripped_conservatively(){
+        assert_eq!(split_title_artist("晴天 - 周杰伦"),Some(("晴天".into(),"周杰伦".into())));
+        assert_eq!(split_title_artist("周杰伦 – 晴天"),Some(("周杰伦".into(),"晴天".into())));
+        assert_eq!(split_title_artist("A - B - C"),None,"多个分隔符时不猜");
+        assert_eq!(split_title_artist("Re-Make"),None,"连字符不是分隔符");
+        assert_eq!(bare_title("【周末电台】晴天 (DJ版)"),"晴天");
+        assert_eq!(bare_title("遥远的她（Live）【现场】"),"遥远的她");
+        assert_eq!(bare_title("(没有歌名)"),"(没有歌名)","去掉后为空时保留原样");
+        assert_eq!(bare_title("晴天"),"晴天");
+    }
     #[test]
     fn resource_network_and_disk_lyrics_have_input_limits(){
         let oversized="x".repeat(2*1024*1024+1);
@@ -1065,6 +1199,53 @@ mod tests {
     }
 
     #[test]
+    fn player_reporting_lead_artist_only_still_matches_collaboration(){
+        // #202：网易云系统会话只报「雄之助」，候选署名是「雄之助、WaMi」。
+        let items=serde_json::json!([
+            {"id":1822506511,"name":"Loop","artists":[{"name":"雄之助"},{"name":"WaMi"}],"duration":185000},
+            {"id":1,"name":"Loop","artists":[{"name":"RHYM"}],"duration":185000},
+            {"id":2,"name":"Loop (Live)","artists":[{"name":"雄之助"}],"duration":185000}
+        ]);
+        assert_eq!(netease_candidates(items.as_array().unwrap(),"Loop","雄之助",185.0),vec![1822506511]);
+        assert!(netease_candidates(items.as_array().unwrap(),"Loop","雄之助",240.0).is_empty(),"时长约束不变");
+        assert!(netease_candidates(items.as_array().unwrap(),"Loop","WaMi、别人",185.0).is_empty(),"播放侧多位歌手时不放宽");
+        // 有完全相同署名的候选时只用它，不混入合唱版。
+        let both=serde_json::json!([
+            {"id":3,"name":"Loop","artists":[{"name":"雄之助"},{"name":"WaMi"}],"duration":185000},
+            {"id":4,"name":"Loop","artists":[{"name":"雄之助"}],"duration":185000}
+        ]);
+        assert_eq!(netease_candidates(both.as_array().unwrap(),"Loop","雄之助",185.0),vec![4]);
+        // 歌名带 feat 的严格用例保持拒绝。
+        let strict=serde_json::json!([{"id":5,"name":"Track","artists":[{"name":"Artist"},{"name":"Guest"},{"name":"Other"}],"duration":120000}]);
+        assert!(netease_candidates(strict.as_array().unwrap(),"Track (feat. Guest)","Artist",120.0).is_empty());
+        // LRCLIB 同样处理。
+        let lrclib=vec![serde_json::json!({"trackName":"Loop","artistName":"雄之助, WaMi"}),serde_json::json!({"trackName":"Loop","artistName":"RHYM"})];
+        let found=lrclib_matches(lrclib,"Loop",&song_identity("Loop","雄之助"));
+        assert_eq!(found.len(),1);assert_eq!(found[0]["artistName"],"雄之助, WaMi");
+    }
+
+    #[test]
+    #[ignore="联网：按 #202 的播放信息（只有主艺人）真实查询网易云、QQ 音乐、LRCLIB"]
+    fn live_lead_artist_only_finds_collaboration_lyrics(){
+        let lyrics=fetch("Loop","雄之助",0.0).expect("应能找到 Loop - 雄之助、WaMi 的歌词");
+        println!("找到 {} 行，同步={}",lyrics.lines.len(),lyrics.synced);
+        assert!(lyrics.synced && !lyrics.lines.is_empty());
+    }
+
+    #[test]
+    fn song_relation_separates_fill_ins_from_other_songs(){
+        assert_eq!(song_relation("Track","甲","Track","甲"),Some(true));
+        assert_eq!(song_relation("Track","","Track","甲"),Some(true),"歌手从空补全仍是同一首");
+        assert_eq!(song_relation("Track","甲 / 乙","Track","乙、甲"),Some(true));
+        assert_eq!(song_relation("有点甜","汪苏泷","有点甜","汪苏泷、BY2"),Some(false),"单人署名补全为合唱");
+        assert_eq!(song_relation("有点甜","汪苏泷、BY2","有点甜","汪苏泷"),Some(false));
+        assert_eq!(song_relation("Track","甲","Track","丙"),None);
+        assert_eq!(song_relation("Track","甲、乙","Track","甲、丙"),None,"部分重叠不算补全");
+        assert_eq!(song_relation("Track (Live)","甲","Track","甲"),None,"不同版本是不同歌曲");
+        assert_eq!(song_relation("","甲","","甲"),None);
+    }
+
+    #[test]
     fn confirmed_missing_lyrics_are_remembered_for_a_week_but_failures_are_not(){
         let path=std::env::temp_dir().join(format!("daozai-negative-{}-{:?}.lrc",std::process::id(),std::thread::current().id()));
         let _=std::fs::remove_file(negative_path(&path));
@@ -1087,6 +1268,19 @@ mod tests {
         let (lrclib,worker)=serve(vec![("200 OK","[]".into())]);
         let (result,failed)=fetch_with_sources_detail(None,None,Some(&lrclib),"Track","Artist",120.0);
         assert_eq!(result.unwrap_err(),FetchError::NotFound);assert!(!failed);worker.join().unwrap();
+    }
+
+    #[test]
+    fn manual_retry_skips_remembered_missing_lyrics_only_during_that_query(){
+        let path=std::env::temp_dir().join(format!("daozai-manual-{}-{:?}.lrc",std::process::id(),std::thread::current().id()));
+        write_negative(&path,None);
+        assert!(read_negative(&path).is_some());
+        {
+            let _skip=SkipNegative::set(true);
+            assert!(read_negative(&path).is_none(),"手动重试应跳过无歌词记录");
+        }
+        assert!(read_negative(&path).is_some(),"查询结束后恢复使用无歌词记录");
+        std::fs::remove_file(negative_path(&path)).unwrap();
     }
 
     #[test]

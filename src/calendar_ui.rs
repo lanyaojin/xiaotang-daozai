@@ -10,6 +10,7 @@ pub(crate) struct State {
     pub events: Vec<mail::Meeting>,
     pub loading: bool,
     pub error: String,
+    pub warning:String,
     pub focus: Option<String>,
     pub scroll_to_focus: bool,
     pub first: usize,
@@ -19,7 +20,7 @@ impl Default for State {
     fn default() -> Self {
         let day=chrono::Local::now().date_naive();
         Self { month:calendar::month_start(day), day, loaded:None, events:vec![], loading:false,
-            error:String::new(), focus:None, scroll_to_focus:false, first:0, show_ended:false }
+            error:String::new(), warning:String::new(), focus:None, scroll_to_focus:false, first:0, show_ended:false }
     }
 }
 
@@ -102,30 +103,13 @@ fn event_status(event:&mail::Meeting,now:i64,today:NaiveDate)->String {
 }
 pub(crate) fn source_icon(c:&Card,source:Source<'_>,x:f32,y:f32,size:f32) {
     let rect=c.rect(x,y,size,size);
-    let png:Option<&[u8]>=match source {
-        Source::Calendar(Some(calendar::Provider::DingTalk))=>Some(include_bytes!("../assets/calendar/dingtalk.png")),
-        _=>None,
-    };
-    if let Some(bytes)=png {
-        let ctx=c.ui.ctx();
-        let key=egui::Id::new(("calendar-source-logo",source.icon_key()));
-        let texture=ctx.data(|data|data.get_temp::<egui::TextureHandle>(key)).unwrap_or_else(||{
-            let mut image=image::load_from_memory(bytes).expect("内置来源图标应为有效图片").into_rgba8();
-            if matches!(source,Source::Calendar(Some(calendar::Provider::DingTalk))) {
-                // 保留白色品牌标记，由统一图标容器绘制蓝色背景和圆角。
-                for pixel in image.pixels_mut(){pixel.0=[255,255,255,(pixel[0] as u16*pixel[3] as u16/255) as u8];}
-            }
-            let image=egui::ColorImage::from_rgba_unmultiplied([image.width() as usize,image.height() as usize],image.as_raw());
-            let texture=ctx.load_texture(source.icon_key(),image,egui::TextureOptions::LINEAR);
-            ctx.data_mut(|data|data.insert_temp(key,texture.clone()));
-            texture
-        });
-        let ding=matches!(source,Source::Calendar(Some(calendar::Provider::DingTalk)));
-        c.fill(x,y,size,size,size*5.0/24.0,if ding{Color32::from_rgb(0,105,255)}else{Color32::WHITE});
-        c.painter.image(texture.id(),rect.shrink(size*0.1),egui::Rect::from_min_max(egui::Pos2::ZERO,egui::pos2(1.0,1.0)),Color32::WHITE);
-        return;
-    }
+    let ding=matches!(source,Source::Calendar(Some(calendar::Provider::DingTalk)));
+    let rect=if ding{
+        c.fill(x,y,size,size,size*5.0/24.0,Color32::from_rgb(0,127,255));
+        rect.shrink(rect.width()*0.1)
+    }else{rect};
     let icon=match source {
+        Source::Calendar(Some(calendar::Provider::DingTalk))=>egui::include_image!("../assets/calendar/dingtalk.svg"),
         Source::Calendar(Some(calendar::Provider::WeCom))=>egui::include_image!("../assets/calendar/wecom.svg"),
         Source::Mail(_)=>egui::include_image!("../assets/calendar/mail.svg"),
         Source::Calendar(Some(calendar::Provider::Feishu))=>egui::include_image!("../assets/calendar/feishu.svg"),
@@ -171,11 +155,23 @@ mod tests {
     }
 
     #[test]
-    fn dingtalk_logo_has_enough_pixels_for_large_notifications() {
-        let image=image::load_from_memory(include_bytes!("../assets/calendar/dingtalk.png")).unwrap();
-        assert!(image.width()>=256 && image.height()>=256,"通知不能放大低分辨率网站图标");
+    fn dingtalk_logo_rasterizes_at_screen_size_and_reuses_textures(){
+        let ctx=egui::Context::default();egui_extras::install_image_loaders(&ctx);
+        let frame=|ctx:&egui::Context|ctx.run(egui::RawInput{
+            viewports:std::iter::once((egui::ViewportId::ROOT,egui::ViewportInfo{native_pixels_per_point:Some(2.0),..Default::default()})).collect(),..Default::default()
+        },|ctx|{egui::CentralPanel::default().show(ctx,|ui|{
+            let c=Card::new(ui,egui::Pos2::ZERO,ui.clip_rect());
+            source_icon(&c,Source::Calendar(Some(calendar::Provider::DingTalk)),0.0,0.0,20.0);
+            source_icon(&c.scaled(50.0,0.0,1.5),Source::Calendar(Some(calendar::Provider::DingTalk)),50.0,0.0,20.0);
+        });});
+        let first=frame(&ctx);let sizes=first.textures_delta.set.iter().map(|(_,delta)|delta.image.size()).collect::<Vec<_>>();
+        assert!(sizes.contains(&[32,32]) && sizes.contains(&[48,48]),"图标应按实际物理像素过滤，而非直接缩小原始大图：{sizes:?}");
+        let logo=first.textures_delta.set.iter().find_map(|(_,delta)|match &delta.image{egui::ImageData::Color(image) if image.size==[32,32]=>Some(image),_=>None}).unwrap();
+        let rows=(0..32).filter(|y|logo.pixels[y*32..(y+1)*32].iter().any(|pixel|pixel.a()>=128)).collect::<Vec<_>>();
+        assert!(rows.last().unwrap()-rows.first().unwrap()+1>=30,"钉钉标记不能因重复留白而缩小到丢失翅膀和闪电细节");
+        let next=frame(&ctx);
+        assert!(!next.textures_delta.set.iter().any(|(_,delta)|matches!(delta.image.size(),[32,32]|[48,48])),"不同显示尺寸应各自复用贴图，不能每帧重新上传");
     }
-
     #[test]
     fn date_markers_merge_repeat_sources_and_show_at_most_three_colors() {
         let feishu=Source::Calendar(Some(calendar::Provider::Feishu));
@@ -219,7 +215,7 @@ impl App {
 
     pub(crate) fn select_calendar_day(&mut self, day:NaiveDate) {
         let month=calendar::month_start(day);
-        if month!=self.calendar.view.month {self.calendar.view.month=month;self.calendar.view.loading=false;self.calendar.view.error.clear();}
+        if month!=self.calendar.view.month {self.calendar.view.month=month;self.calendar.view.loading=false;self.calendar.view.error.clear();self.calendar.view.warning.clear();}
         self.calendar.view.day=day;
         self.calendar.view.show_ended=day<chrono::Local::now().date_naive();
         self.calendar.view.focus=None;
@@ -232,8 +228,8 @@ impl App {
         let has_accounts=!self.calendar_configs().is_empty();
         let view=&mut self.calendar.view;
         if !has_accounts || !force && (view.loaded==Some(view.month) || view.loading || !view.error.is_empty()){return;}
-        view.loading=true;view.error.clear();
-        for feed in &mut self.calendar.feeds {feed.month.loading=true;feed.month.error.clear();}
+        view.loading=true;view.error.clear();view.warning.clear();
+        for feed in &mut self.calendar.feeds {feed.month.loading=true;feed.month.error.clear();feed.month.warning.clear();}
         self.pending.push(Cmd::CalendarMonth(view.month));
     }
 
@@ -320,9 +316,9 @@ impl App {
         let day=self.calendar.view.day;
         let heading=format!("{} · {}月{}日",if day==today{"今天"}else{["周一","周二","周三","周四","周五","周六","周日"][day.weekday().num_days_from_monday() as usize]},day.month(),day.day());
         c.text(167.0,44.0,&heading,8.8,W::Semibold,accent,H::Left);
-        let status=if self.calendar.view.loading{"同步中".to_string()}else if !self.calendar.view.error.is_empty(){"重试同步".to_string()}else {let at=self.calendar.feeds.iter().map(|feed|feed.last_sync.as_str()).max().unwrap_or(&self.calendar.last_sync);if at.is_empty(){"".into()}else{format!("{} 更新",at.split_whitespace().last().unwrap_or(""))}};
+        let status=if self.calendar.view.loading{"同步中".to_string()}else if !self.calendar.view.error.is_empty(){"重试同步".to_string()}else if !self.calendar.view.warning.is_empty(){"部分同步".to_string()}else {let at=self.calendar.feeds.iter().map(|feed|feed.last_sync.as_str()).max().unwrap_or(&self.calendar.last_sync);if at.is_empty(){"".into()}else{format!("{} 更新",at.split_whitespace().last().unwrap_or(""))}};
         c.text(376.0,44.0,&status,7.4,W::Regular,muted,H::Right);
-        let sync_hint=if self.calendar.view.error.is_empty(){"同步这个月份"}else{self.calendar.view.error.as_str()};
+        let sync_hint=if !self.calendar.view.error.is_empty(){self.calendar.view.error.as_str()}else if !self.calendar.view.warning.is_empty(){self.calendar.view.warning.as_str()}else{"同步这个月份"};
         if !self.calendar_configs().is_empty() && !self.calendar.view.loading && c.hit(326.0,33.0,52.0,15.0,"calendar-sync").on_hover_text(sync_hint).clicked(){self.request_calendar_month(true);}
         let focus=self.calendar.view.focus.clone();
         let scroll_to_focus=if c.live{std::mem::take(&mut self.calendar.view.scroll_to_focus)}else{false};
@@ -339,7 +335,7 @@ impl App {
         if scroll_to_focus {first=0;}
         first=first.min(max);
         if featured_index.is_none() {
-            let message=if self.calendar.view.loading && events.is_empty(){"正在获取日程…"}else if !self.calendar.view.error.is_empty() && events.is_empty(){"暂时无法获取日程"}else if ended_count>0 && events.is_empty(){"当天日程已结束"}else if events.is_empty(){"当天暂无日程"}else{"暂无待开始的定时日程"};
+            let message=if self.calendar.view.loading && events.is_empty(){"正在获取日程…"}else if !self.calendar.view.error.is_empty() && events.is_empty(){"暂时无法获取日程"}else if !self.calendar.view.warning.is_empty() && events.is_empty(){"部分日程未同步"}else if ended_count>0 && events.is_empty(){"当天日程已结束"}else if events.is_empty(){"当天暂无日程"}else{"暂无待开始的定时日程"};
             c.centered_text(271.0,76.0,message,11.0,W::Regular,theme::GRAY,H::Center);
             if events.is_empty(){
                 let (button,b)=paint::capsule(c,214.0,93.0,70.0,20.0,"calendar-empty-add",theme::BTN,theme::BTN_HOVER);
@@ -409,6 +405,7 @@ impl App {
         if let Some(uid)=edit_local{self.open_calendar_editor(Some(&uid));}
         if add_local{self.open_calendar_editor(None);}
         if let Some(event)=ignored{self.toggle_mail_event(&event);}
-        if connect {self.settings_tab=8;self.open_settings();}
+        // 从日程窗口「连接日历」进来：直接打开设置页的添加日历弹窗。
+        if connect {self.settings_tab=8;self.calendar.form.open=true;self.calendar.form.guide_open=true;self.open_settings();}
     }
 }

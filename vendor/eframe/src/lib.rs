@@ -467,6 +467,10 @@ pub type Result<T = (), E = Error> = std::result::Result<T, E>;
 #[cfg(not(target_arch = "wasm32"))]
 static ROOT_VIEWPORT_SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3F80_0000); // 1.0
 
+/// 原生 wgpu 在当前帧截图，并在应用的下一帧起点收取结果。
+#[derive(Debug)]
+pub struct InteractiveCapture(pub std::time::Instant);
+
 /// 设置主窗口的额外缩放倍率（下一帧生效）。非有限值或越界值会被收回到 0.5..=3.0。
 #[cfg(not(target_arch = "wasm32"))]
 pub fn set_root_viewport_scale(scale: f32) {

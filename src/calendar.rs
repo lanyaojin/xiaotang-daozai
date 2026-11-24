@@ -8,6 +8,11 @@
 //! 配置文件里只有平台、用户名、日历地址；不落盘正文、不进日志。
 
 mod exchange;
+#[cfg(test)]
+#[path="calendar/compatibility_tests.rs"]
+mod compatibility_tests;
+#[cfg(test)]
+mod transport_tests;
 
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
@@ -397,6 +402,8 @@ pub struct Failure {
     pub status: Option<u16>,
     pub message: String,
     request_url: Option<String>,
+    report:Option<ReadReport>,
+    kind: &'static str,
 }
 
 impl Failure {
@@ -412,7 +419,7 @@ impl Failure {
             500..=599 => format!("服务器出错（{code}），稍后再试"),
             _ => format!("服务器返回 {code}"),
         };
-        Self { status: Some(code), message, request_url: None }
+        Self { status: Some(code), message, request_url: None,report:None,kind:"http" }
     }
 
     fn at_url(mut self, url: &url::Url) -> Self {
@@ -425,24 +432,116 @@ impl Failure {
         self
     }
 
-    fn transport(_detail: &str) -> Self {
-        Self { status: None, message: "连不上服务器，检查网络".into(), request_url: None }
+    fn transport(error: &(dyn std::error::Error + 'static)) -> Self {
+        let (kind, message) = transport_issue(error).details();
+        Self { kind, ..Self::text(message) }
     }
 
     fn text(message: impl Into<String>) -> Self {
-        Self { status: None, message: message.into(), request_url: None }
+        Self { status: None, message: message.into(), request_url: None,report:None,kind:"calendar" }
+    }
+    fn with_report(mut self,report:ReadReport)->Self{self.report=Some(report);self}
+}
+
+#[derive(Clone, Copy)]
+enum TransportIssue { Untrusted, Validity, Name, Revoked, Certificate, Tls, Timeout, Dns, Refused, Proxy, Network }
+
+impl TransportIssue {
+    fn details(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Untrusted => ("certificate_untrusted", "日历服务器证书不受信任，请先在 Windows 中信任服务器证书或其颁发机构"),
+            Self::Validity => ("certificate_validity", "日历服务器证书不在有效期内，请检查系统时间或联系管理员更新证书"),
+            Self::Name => ("certificate_name", "日历服务器证书与服务器地址不匹配，请使用证书对应的域名或联系管理员更新证书"),
+            Self::Revoked => ("certificate_revoked", "日历服务器证书已被吊销，请联系管理员更新证书"),
+            Self::Certificate => ("certificate_invalid", "日历服务器证书验证失败，请联系管理员检查证书及证书链"),
+            Self::Tls => ("tls_handshake", "无法与日历服务器建立安全连接（TLS 握手失败），请检查服务器证书和 TLS 配置"),
+            Self::Timeout => ("timeout", "日历服务器连接超时，请检查网络或稍后重试"),
+            Self::Dns => ("dns", "无法解析日历服务器地址，请核对域名和网络"),
+            Self::Refused => ("connection_refused", "日历服务器拒绝连接，请核对服务器端口及服务是否启动"),
+            Self::Proxy => ("proxy", "无法连接日历代理服务器，请检查代理配置及认证"),
+            Self::Network => ("network", "连不上服务器，检查网络"),
+        }
     }
 }
 
-fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
+#[cfg(windows)]
+fn windows_transport_issue(code: u32) -> Option<TransportIssue> {
+    Some(match code {
+        0x800b0109 | 0x800b010a | 0x80090325 => TransportIssue::Untrusted,
+        0x800b0101 | 0x80090328 => TransportIssue::Validity,
+        0x800b010f | 0x80090322 => TransportIssue::Name,
+        0x800b010c | 0x80092010 => TransportIssue::Revoked,
+        0x800b0100..=0x800b0114 => TransportIssue::Certificate,
+        10060 => TransportIssue::Timeout,
+        10061 => TransportIssue::Refused,
+        11001 | 11004 => TransportIssue::Dns,
+        _ => return None,
+    })
+}
+
+fn transport_issue(mut error: &(dyn std::error::Error + 'static)) -> TransportIssue {
+    let mut issue = TransportIssue::Network;
+    loop {
+        if let Some(ureq::Error::Transport(inner)) = error.downcast_ref::<ureq::Error>() { error = inner; continue; }
+        if let Some(error) = error.downcast_ref::<ureq::Transport>() {
+            match error.kind() {
+                ureq::ErrorKind::Dns => return TransportIssue::Dns,
+                ureq::ErrorKind::ProxyConnect | ureq::ErrorKind::ProxyUnauthorized | ureq::ErrorKind::InvalidProxyUrl => return TransportIssue::Proxy,
+                _ => {}
+            }
+        }
+        if let Some(io) = error.downcast_ref::<std::io::Error>() {
+            #[cfg(windows)]
+            if let Some(issue) = io.raw_os_error().and_then(|code| windows_transport_issue(code as u32)) { return issue; }
+            match io.kind() {
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => return TransportIssue::Timeout,
+                std::io::ErrorKind::ConnectionRefused => return TransportIssue::Refused,
+                _ => {}
+            }
+            // io::Error 的 source() 可能跳过内层错误本身，优先保留其具体类型。
+            if let Some(inner) = io.get_ref() { error = inner; continue; }
+        }
+        #[cfg(windows)]
+        if let Some(native) = error.downcast_ref::<native_tls::Error>() {
+            // native-tls 不公开底层系统错误码；只读 Rust 的数字后缀，不匹配本地化文案。
+            let detail = native.to_string();
+            let code = detail.rsplit_once("(os error ").and_then(|(_, code)| code.strip_suffix(')'))
+                .and_then(|code| code.parse::<i32>().ok());
+            return code.and_then(|code| windows_transport_issue(code as u32)).unwrap_or(TransportIssue::Tls);
+        }
+        if let Some(tls) = error.downcast_ref::<ureq::rustls::Error>() {
+            use ureq::rustls::CertificateError as Cert;
+            return match tls {
+                ureq::rustls::Error::InvalidCertificate(cert) => match cert {
+                    Cert::UnknownIssuer => TransportIssue::Untrusted,
+                    Cert::Expired | Cert::ExpiredContext { .. } | Cert::NotValidYet | Cert::NotValidYetContext { .. } => TransportIssue::Validity,
+                    Cert::NotValidForName | Cert::NotValidForNameContext { .. } => TransportIssue::Name,
+                    Cert::Revoked => TransportIssue::Revoked,
+                    _ => TransportIssue::Certificate,
+                },
+                _ => TransportIssue::Tls,
+            };
+        }
+        if let Some(transport) = error.downcast_ref::<ureq::Transport>() {
+            if matches!(transport.message(), Some("tls connection init failed" | "native_tls connect failed")) { issue = TransportIssue::Tls; }
+        }
+        match error.source() { Some(source) => error = source, None => return issue }
+    }
+}
+
+fn agent() -> Result<ureq::Agent, Failure> {
+    let builder = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
         .timeout_read(Duration::from_secs(20))
         .timeout_write(Duration::from_secs(20))
         .timeout(Duration::from_secs(30))
         .redirects(0)
-        .user_agent(concat!("Daozai/",env!("CARGO_PKG_VERSION")))
-        .build()
+        .user_agent(concat!("Daozai/",env!("CARGO_PKG_VERSION")));
+    // 仅日历使用系统证书验证，继承用户已信任的自签证书和私有 CA。
+    #[cfg(windows)]
+    let builder = builder.tls_connector(std::sync::Arc::new(native_tls::TlsConnector::new()
+        .map_err(|_| Failure::text("无法初始化日历安全连接，请重启岛仔后重试"))?));
+    Ok(builder.build())
 }
 
 /// `Authorization: Basic base64(用户名:密码)`。
@@ -488,9 +587,9 @@ fn dav_response(
                     .map_err(|_|Failure::text("日历重定向地址无效"))?;
             }
             Ok(r) if r.status()>=300=>return Err(Failure::status(cfg.provider,r.status()).at_url(&target)),
-            Ok(r)=>return r.into_string().map(|xml|(xml,target.to_string())).map_err(|e|Failure::transport(&e.to_string())),
+            Ok(r)=>return r.into_string().map(|xml|(xml,target.to_string())).map_err(|e|Failure::transport(&e)),
             Err(ureq::Error::Status(code,_))=>return Err(Failure::status(cfg.provider,code).at_url(&target)),
-            Err(e)=>return Err(Failure::transport(&e.to_string())),
+            Err(e)=>return Err(Failure::transport(&e)),
         }
     }
     Err(Failure::text("日历重定向次数过多"))
@@ -527,16 +626,58 @@ fn report_body(provider: Provider, start: &str, end: &str) -> String {
 }
 
 /// 一次拉取的结果。
+#[derive(Clone,Debug,Default,PartialEq,Eq)]
+pub struct ReadReport {
+    pub calendars:usize,
+    pub failed:usize,
+    pub received:usize,
+    pub invalid:usize,
+    pub outside:usize,
+    pub unsupported:usize,
+    pub cancelled:usize,
+    pub limited:bool,
+    pub issue:Option<String>,
+    pub status:Option<u16>,
+}
+impl ReadReport {
+    fn problem(&mut self,message:impl Into<String>){if self.issue.is_none(){self.issue=Some(message.into());}}
+    pub(crate) fn merge(&mut self,other:Self){
+        self.calendars+=other.calendars;self.failed+=other.failed;self.received+=other.received;
+        self.invalid+=other.invalid;self.outside+=other.outside;self.unsupported+=other.unsupported;self.cancelled+=other.cancelled;
+        self.limited|=other.limited;if self.issue.is_none(){self.issue=other.issue;}self.status=self.status.or(other.status);
+    }
+    pub fn warning(&self)->String{
+        let mut parts=Vec::new();
+        if self.failed>0{parts.push(format!("{} 处日历读取失败",self.failed));}
+        if self.invalid>0{parts.push(format!("{} 条日程无法解析",self.invalid));}
+        if self.unsupported>0{parts.push(format!("{} 条待办等非日程记录已跳过",self.unsupported));}
+        if self.limited{parts.push("已达到读取上限，结果可能不完整".into());}
+        if !parts.is_empty(){if let Some(issue)=&self.issue{parts.push(issue.clone());}}
+        parts.join("；")
+    }
+}
+pub struct ParsedEvents {pub events:Vec<crate::mail::Meeting>,pub report:ReadReport}
+
 pub struct Fetched {
     pub href: String,
     pub events: Vec<crate::mail::Meeting>,
+    pub report:ReadReport,
+}
 
+fn record_fetch(provider:Provider,scope:&str,result:&Result<Fetched,Failure>){
+    if cfg!(test){return;}
+    let empty=ReadReport::default();
+    let (report,parsed,status)=match result{Ok(f)=>(&f.report,f.events.len(),f.report.status),Err(e)=>(e.report.as_ref().unwrap_or(&empty),0,e.status.or(e.report.as_ref().and_then(|report|report.status)))};
+    let reason=result.as_ref().err().map_or("none",|error|error.kind);
+    let line=format!("provider={} scope={scope} error={} reason={reason} calendars={} failed={} received={} parsed_instances={parsed} outside={} invalid={} unsupported={} cancelled={} limited={} status={}",provider.key(),result.is_err(),report.calendars,report.failed,report.received,report.outside,report.invalid,report.unsupported,report.cancelled,report.limited,status.unwrap_or(0));
+    crate::resources::append_log(&crate::model::config_dir().join("diagnostics"),"calendar.log",&format!("{} {line}",chrono::Utc::now().timestamp()));
 }
 
 /// 发现日历 → 查询滚动的 24 小时时间窗口 → 解析。
 pub fn fetch(cfg: &Config, password: &str) -> Result<Fetched, Failure> {
     let now = chrono::Utc::now();
-    fetch_range(cfg, password, now - chrono::Duration::minutes(1), now + chrono::Duration::seconds(WINDOW_SECS))
+    let result=fetch_range(cfg, password, now - chrono::Duration::minutes(1), now + chrono::Duration::seconds(WINDOW_SECS));
+    record_fetch(cfg.provider,"upcoming",&result);result
 }
 
 pub fn month_start(date: NaiveDate) -> NaiveDate { date.with_day(1).unwrap() }
@@ -552,29 +693,30 @@ pub fn fetch_month(cfg: &Config, password: &str, month: NaiveDate) -> Result<Fet
     let first = month_start(month);
     let end = first.checked_add_months(chrono::Months::new(1)).unwrap();
     let utc = |date: NaiveDate| date.and_hms_opt(0, 0, 0).unwrap().and_local_timezone(chrono::Local).earliest().unwrap().with_timezone(&chrono::Utc);
-    fetch_range(cfg, password, utc(first), utc(end))
+    let result=fetch_range(cfg, password, utc(first), utc(end));record_fetch(cfg.provider,"month",&result);result
 }
 
 fn fetch_range(cfg: &Config, password: &str, lo: chrono::DateTime<chrono::Utc>, hi: chrono::DateTime<chrono::Utc>) -> Result<Fetched, Failure> {
     if cfg.provider.exchange() { return exchange::fetch(cfg, password, lo, hi); }
-    let agent = agent();
+    let agent = agent()?;
     // 每次都发现全部日历：已保存的地址可能指向空日历，会遮蔽同一账号下的其他日历。
     // 逐个查询，单个日历失败不影响其他日历，全部失败才报错。
-    let calendars=discover_calendars(&agent,cfg,password).map_err(|e|e.at_stage("查找日历"))?;
+    let (calendars,mut report)=discover_calendars(&agent,cfg,password).map_err(|e|e.at_stage("查找日历"))?;
     let href=calendars.first().cloned().ok_or_else(||Failure::text("没有找到可读取的日历"))?;
     let mut events=Vec::new();
     let mut first_error=None;
     let mut ok=false;
     for collection in &calendars {
         match fetch_collection(&agent,cfg,password,collection,lo,hi) {
-            Ok(found)=>{ok=true;events.extend(found.events);}
-            Err(error)=>{first_error.get_or_insert(error.at_stage("读取日程"));}
+            Ok(found)=>{ok=true;events.extend(found.events);report.merge(found.report);}
+            Err(error)=>{report.failed+=1;report.status=report.status.or(error.status);let error=error.at_stage("读取日程");report.problem(error.message.clone());first_error.get_or_insert(error);}
         }
     }
-    if !ok {return Err(first_error.unwrap_or_else(||Failure::text("没有找到日历")));}
+    if !ok {return Err(first_error.unwrap_or_else(||Failure::text("没有找到日历")).with_report(report));}
+    if events.is_empty() && report.invalid>0{return Err(Failure::text(report.warning()).with_report(report));}
     events.sort_by_key(|m|m.start);
     let mut seen=std::collections::HashSet::new();events.retain(|m|seen.insert(dedupe_key(m)));
-    Ok(Fetched{href,events})
+    Ok(Fetched{href,events,report})
 }
 
 fn fetch_collection(agent:&ureq::Agent,cfg:&Config,password:&str,href:&str,lo:chrono::DateTime<chrono::Utc>,hi:chrono::DateTime<chrono::Utc>)->Result<Fetched,Failure>{
@@ -582,7 +724,8 @@ fn fetch_collection(agent:&ureq::Agent,cfg:&Config,password:&str,href:&str,lo:ch
     let start = lo.format("%Y%m%dT%H%M%SZ").to_string();
     let end = hi.format("%Y%m%dT%H%M%SZ").to_string();
     let mut xml = dav(&agent, "REPORT", &href, "1", &report_body(cfg.provider, &start, &end), cfg, password)?;
-    if report_status_error(&xml).is_some() || (calendar_data(&xml).is_empty() && !responses(&xml).is_empty()) {
+    let mut has_data=calendar_data(&xml).iter().any(|data|!data.trim().is_empty());
+    if !has_data && (report_status_error(&xml).is_some() || !responses(&xml).is_empty()) {
         // 有的服务只列资源，或在查询结果中附带集合本身；集合不能当成日程读取。
         if let Some(code @ (401|403))=report_status_error(&xml){return Err(Failure::status(cfg.provider,code));}
         let mut refs=report_resource_refs(&xml,&href)?;
@@ -592,19 +735,23 @@ fn fetch_collection(agent:&ureq::Agent,cfg:&Config,password:&str,href:&str,lo:ch
             refs=report_resource_refs(&listing,&href)?;
             if refs.is_empty() {
                 if let Some(code)=report_status_error(&xml){return Err(Failure::status(cfg.provider,code));}
-                return Ok(Fetched{href,events:vec![]});
+                return Ok(Fetched{href,events:vec![],report:ReadReport::default()});
             }
         }
         let data=calendar_data_request(cfg.provider,&start,&end);
         let body=format!(r#"<c:calendar-multiget xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><d:getetag/>{data}</d:prop>{refs}</c:calendar-multiget>"#);
         xml=dav(&agent,"REPORT",&href,"1",&body,cfg,password)?;
-        if calendar_data(&xml).is_empty() && report_status_error(&xml).is_none() {
+        has_data=calendar_data(&xml).iter().any(|data|!data.trim().is_empty());
+        if !has_data && report_status_error(&xml).is_none() {
             return Err(Failure::text("服务器未返回日程内容，请检查日历读取权限"));
         }
     }
-    if let Some(code)=report_status_error(&xml){return Err(Failure::status(cfg.provider,code));}
-    let events=events_in_range(&xml,lo,hi)?;
-    Ok(Fetched { href, events })
+    let ParsedEvents{events,mut report}=parse_events_in_range(&xml,lo,hi);
+    if let Some(code)=report_status_error(&xml){
+        if !has_data{return Err(Failure::status(cfg.provider,code));}
+        report.failed+=1;report.status=Some(code);report.problem(Failure::status(cfg.provider,code).message);
+    }
+    Ok(Fetched { href, events, report })
 }
 
 fn report_resource_refs(xml:&str,href:&str)->Result<String,Failure> {
@@ -622,7 +769,7 @@ fn report_resource_refs(xml:&str,href:&str)->Result<String,Failure> {
     Ok(refs)
 }
 
-fn discover_calendars(agent: &ureq::Agent, cfg: &Config, password: &str) -> Result<Vec<String>, Failure> {
+fn discover_calendars(agent: &ureq::Agent, cfg: &Config, password: &str) -> Result<(Vec<String>,ReadReport), Failure> {
     let base = ensure_slash(cfg.base().trim());
     let root=path_of(&base)=="/";
     if let Some(calendar)=discover_at(agent,cfg,password,&base,"1")? {
@@ -640,12 +787,14 @@ fn discover_calendars(agent: &ureq::Agent, cfg: &Config, password: &str) -> Resu
     Err(Failure::text("没有找到日历，请确认这个账号能在客户端里同步日程"))
 }
 
-fn discover_at(agent:&ureq::Agent,cfg:&Config,password:&str,start:&str,depth:&str)->Result<Option<Vec<String>>,Failure>{
-    let mut next=start.to_owned();let mut depth=depth;
+fn discover_at(agent:&ureq::Agent,cfg:&Config,password:&str,start:&str,depth:&str)->Result<Option<(Vec<String>,ReadReport)>,Failure>{
+    let mut queue=std::collections::VecDeque::from([(start.to_owned(),depth.to_owned())]);
     let mut visited=std::collections::HashSet::new();
+    let mut found=Vec::new();let mut report=ReadReport::default();let mut first_error=None;
     for _ in 0..8 {
-        if !visited.insert(next.clone()){return Err(Failure::text("日历服务器返回了循环的发现地址"));}
-        let (xml,base)=match dav_response(agent,"PROPFIND",&next,depth,PROPFIND_BODY,cfg,password) {
+        let Some((next,depth))=queue.pop_front()else{break;};
+        if !visited.insert(next.clone()){continue;}
+        let (xml,base)=match dav_response(agent,"PROPFIND",&next,&depth,PROPFIND_BODY,cfg,password) {
             Ok(response)=>response,
             Err(error)=>{
                 // 仅跳过初始入口自身的错误，重定向或属性发现后的服务错误原样返回。
@@ -656,19 +805,29 @@ fn discover_at(agent:&ureq::Agent,cfg:&Config,password:&str,start:&str,depth:&st
                     _=>false,
                 };
                 if initial && unavailable {return Ok(None);}
-                return Err(error);
+                report.failed+=1;report.status=report.status.or(error.status);report.problem(error.message.clone());
+                if found.is_empty() && queue.is_empty(){return Err(error.with_report(report));}
+                first_error.get_or_insert(error);continue;
             }
         };
         visited.insert(base.clone());
-        let calendars=calendar_collections(&xml,&base);
-        if !calendars.is_empty(){return Ok(Some(calendars));}
-        if let Some(home)=calendar_home(&xml,&base).filter(|url|!visited.contains(url)) {
-            next=home;depth="1";
-        } else if let Some(principal)=property_href(&xml,"current-user-principal",&base).filter(|url|!visited.contains(url)) {
-            next=principal;depth="0";
-        } else {return Ok(None);}
+        for calendar in calendar_collections(&xml,&base){
+            if found.contains(&calendar){continue;}
+            if found.len()==12{report.limited=true;break;}
+            found.push(calendar);
+        }
+        let homes=property_hrefs(&xml,"calendar-home-set",&base);
+        let (targets,depth)=if homes.is_empty(){(property_hrefs(&xml,"current-user-principal",&base),"0")}else{(homes,"1")};
+        for target in targets {
+            if visited.contains(&target)||queue.iter().any(|(url,_)|url==&target){continue;}
+            if queue.len()>=8{report.limited=true;break;}
+            queue.push_back((target,depth.to_owned()));
+        }
+        if found.len()==12 && !queue.is_empty(){report.limited=true;break;}
     }
-    Err(Failure::text("日历服务发现次数过多，请重新连接"))
+    if !queue.is_empty(){report.limited=true;}
+    report.calendars=found.len();
+    if found.is_empty(){if let Some(error)=first_error{Err(error.with_report(report))}else if report.limited{Err(Failure::text("日历服务发现次数过多，请重新连接").with_report(report))}else{Ok(None)}}else{Ok(Some((found,report)))}
 }
 
 // ---------------------------------------------------------------- XML
@@ -698,31 +857,35 @@ fn responses(xml: &str) -> Vec<(String, bool, bool)> {
         .collect()
 }
 
+#[cfg(test)]
 fn calendar_home(xml: &str, base: &str) -> Option<String> {
     property_href(xml,"calendar-home-set",base)
 }
 
+#[cfg(test)]
 fn property_href(xml:&str,property:&str,base:&str)->Option<String>{
-    let block = regex::Regex::new(&format!(r"(?is)<(?:[a-z0-9]+:)?{property}\b[^>]*>(.*?)</(?:[a-z0-9]+:)?{property}>")).ok()?;
-    let href_re = regex::Regex::new(r"(?is)<(?:[a-z0-9]+:)?href\b[^>]*>(.*?)</(?:[a-z0-9]+:)?href>").ok()?;
-    let inner = block.captures(xml)?.get(1)?.as_str();
-    let href = href_re.captures(inner)?.get(1)?.as_str().trim();
-    if href.is_empty() {
-        return None;
-    }
-    url::Url::parse(base).ok()?.join(&unescape_xml(href)).ok().map(|url|url.to_string())
+    property_hrefs(xml,property,base).into_iter().next()
+}
+fn property_hrefs(xml:&str,property:&str,base:&str)->Vec<String>{
+    let block=regex::Regex::new(&format!(r"(?is)<(?:[a-z0-9]+:)?{property}\b[^>]*>(.*?)</(?:[a-z0-9]+:)?{property}>")).unwrap();
+    let href=regex::Regex::new(r"(?is)<(?:[a-z0-9]+:)?href\b[^>]*>(.*?)</(?:[a-z0-9]+:)?href>").unwrap();
+    let mut urls=Vec::new();let Ok(base)=url::Url::parse(base)else{return urls;};
+    for property in block.captures_iter(xml){for value in href.captures_iter(&property[1]){
+        let value=unescape_xml(value[1].trim());if value.is_empty(){continue;}
+        if let Ok(url)=base.join(&value){let url=url.to_string();if !urls.contains(&url){urls.push(url);}if urls.len()>=9{return urls;}}
+    }}urls
 }
 
 fn calendar_collections(xml:&str,base:&str)->Vec<String>{
     // 只取能放日程（VEVENT）的日历集合，跳过只放提醒事项的列表，最多 12 个。
     let mut calendars=event_calendars(xml,base);
-    if calendars.is_empty(){if let Some(url)=pick_calendar(xml,base){calendars.push(url);}}
+    if calendars.is_empty() && !responses(xml).iter().any(|(_,calendar,_)|*calendar){if let Some(url)=pick_calendar(xml,base){calendars.push(url);}}
     calendars
 }
 
 #[cfg(test)]
 fn discover(agent:&ureq::Agent,cfg:&Config,password:&str)->Result<String,Failure>{
-    discover_calendars(agent,cfg,password)?.into_iter().next().ok_or_else(||Failure::text("没有找到日历"))
+    discover_calendars(agent,cfg,password)?.0.into_iter().next().ok_or_else(||Failure::text("没有找到日历"))
 }
 
 /// 只选择日历集合或已有的 UUID 兼容路径，不能把主目录/收件箱当成日历。
@@ -764,17 +927,39 @@ fn event_calendars(xml: &str, base: &str) -> Vec<String> {
         let Ok(url) = base_url.join(&href) else { continue; };
         let url = url.to_string();
         if !out.contains(&url) { out.push(url); }
-        if out.len() >= 12 { break; }
+        if out.len() > 12 { break; }
     }
     out
 }
 
 /// 从 .ics 文件（苹果「日历」导出、订阅链接下载等）读出时间范围内的日程，重复日程会展开。
 pub fn events_from_ics(ics: &str, lo: chrono::DateTime<chrono::Utc>, hi: chrono::DateTime<chrono::Utc>) -> Result<Vec<crate::mail::Meeting>, String> {
-    if !ics.contains("BEGIN:VCALENDAR") && !ics.contains("BEGIN:VEVENT") { return Err("不是有效的日历文件（.ics）".into()); }
+    let parsed=inspect_ics(ics,lo,hi)?;
+    if parsed.events.is_empty() && parsed.report.invalid>0{return Err(parsed.report.warning());}
+    Ok(parsed.events)
+}
+
+pub fn inspect_ics(ics:&str,lo:chrono::DateTime<chrono::Utc>,hi:chrono::DateTime<chrono::Utc>)->Result<ParsedEvents,String>{
+    if !ical_lines(ics).iter().any(|line|matches!(line.as_str(),"BEGIN:VCALENDAR"|"BEGIN:VEVENT")){return Err("不是有效的日历文件（.ics）".into());}
     let escaped = ics.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
     let xml = format!("<d:response><c:calendar-data>{escaped}</c:calendar-data></d:response>");
-    events_in_range(&xml, lo, hi).map_err(|e| e.message)
+    Ok(parse_events_in_range(&xml,lo,hi))
+}
+
+fn ical_lines(text:&str)->Vec<String>{
+    let mut lines:Vec<String>=Vec::new();
+    for line in text.trim_start_matches('\u{feff}').lines(){
+        let line=line.trim_end_matches('\r');
+        if (line.starts_with(' ')||line.starts_with('\t')) && !lines.is_empty(){lines.last_mut().unwrap().push_str(&line[1..]);}
+        else{lines.push(line.to_owned());}
+    }
+    for line in &mut lines{if let Some((head,value))=line.split_once(':'){
+        let head=head.split(';').map(|part|match part.split_once('='){
+            Some((key,value))=>format!("{}={value}",key.to_ascii_uppercase()),None=>part.to_ascii_uppercase(),
+        }).collect::<Vec<_>>().join(";");
+        let value=if matches!(head.as_str(),"BEGIN"|"END"|"METHOD"|"RRULE"|"STATUS"){value.to_ascii_uppercase()}else{value.to_owned()};
+        *line=format!("{head}:{value}");
+    }}lines
 }
 
 fn calendar_data(xml: &str) -> Vec<String> {
@@ -833,55 +1018,86 @@ fn report_status_error(xml:&str)->Option<u16>{
 }
 
 /// 服务器未展开重复日程时，在查询窗口内展开，并用单次修改或取消覆盖原实例。
+#[cfg(test)]
 fn events_in_range(xml:&str,lo:chrono::DateTime<chrono::Utc>,hi:chrono::DateTime<chrono::Utc>)->Result<Vec<crate::mail::Meeting>,Failure>{
-    let mut blocks=Vec::new();
+    let parsed=parse_events_in_range(xml,lo,hi);
+    if parsed.events.is_empty() && parsed.report.invalid>0{return Err(Failure::text(parsed.report.warning()));}
+    Ok(parsed.events)
+}
+
+fn parse_events_in_range(xml:&str,lo:chrono::DateTime<chrono::Utc>,hi:chrono::DateTime<chrono::Utc>)->ParsedEvents{
+    let mut report=ReadReport::default();let mut blocks=Vec::new();
     for data in calendar_data(xml){
-        let unfolded=data.replace("\r\n","\n").replace("\n ","").replace("\n\t","");
-        if unfolded.lines().any(|line|line.eq_ignore_ascii_case("METHOD:CANCEL")){continue;}
-        for part in unfolded.split("BEGIN:VEVENT").skip(1){
-            if let Some((body,_))=part.split_once("END:VEVENT") {blocks.push(body.to_string());}
-        }
+        let lines=ical_lines(&data);
+        if lines.iter().any(|line|line=="METHOD:CANCEL"){report.cancelled+=lines.iter().filter(|line|line.as_str()=="BEGIN:VEVENT").count();continue;}
+        let mut body=None::<String>;
+        for line in lines{match line.as_str(){
+            "BEGIN:VTODO"|"BEGIN:VJOURNAL"|"BEGIN:VFREEBUSY"=>report.unsupported+=1,
+            "BEGIN:VEVENT"=>{report.received+=1;if body.is_some(){report.invalid+=1;}body=Some(String::new());}
+            "END:VEVENT"=>if let Some(body)=body.take(){blocks.push(body);},
+            _=>if let Some(body)=&mut body{body.push_str(&line);body.push('\n');},
+        }}
+        if body.is_some(){report.invalid+=1;report.problem("日程内容不完整");}
     }
-    let field=|body:&str,name:&str|body.lines().find(|line|line.split([';',':']).next()==Some(name)).map(str::to_string);
-    let mut overrides=std::collections::HashSet::new();
-    for body in &blocks {
-        if let Some(id)=field(body,"RECURRENCE-ID"){
-            if id.contains("RANGE="){return Err(Failure::text("暂不支持从某次起批量改动的重复日程"));}
-            let synthetic=format!("BEGIN:VEVENT\n{}\nEND:VEVENT",id.replacen("RECURRENCE-ID","DTSTART",1));
-            let Some(at)=crate::mail::meetings_of(&synthetic).first().map(|m|m.start) else{return Err(Failure::text("无法解析重复日程的修改时间"));};
-            overrides.insert((field(body,"UID").unwrap_or_default(),at));
-        }
-    }
+    let field=|body:&str,name:&str|{
+        let mut nested=0;
+        for line in body.lines(){
+            if line.starts_with("BEGIN:"){nested+=1;continue;}
+            if line.starts_with("END:"){nested-=1;continue;}
+            if nested==0 && line.split([';',':']).next()==Some(name){return Some(line.to_owned());}
+        }None
+    };
+    let cancelled=|body:&str|field(body,"STATUS").is_some_and(|line|line=="STATUS:CANCELLED");
+    let mut overrides=std::collections::HashSet::new();let mut invalid_series=std::collections::HashSet::new();
+    for body in &blocks{if let Some(id)=field(body,"RECURRENCE-ID"){
+        let synthetic=format!("BEGIN:VEVENT\n{}\nEND:VEVENT",id.replacen("RECURRENCE-ID","DTSTART",1));
+        let at=crate::mail::meetings_of(&synthetic).first().map(|m|m.start);
+        let valid_start=cancelled(body)||!crate::mail::meetings_of(&format!("BEGIN:VEVENT\n{body}END:VEVENT")).is_empty();
+        if id.contains("RANGE=")||at.is_none()||!valid_start{
+            if let Some(uid)=field(body,"UID"){invalid_series.insert(uid);}
+            report.problem("部分重复日程的修改规则或时间暂无法解析");
+        }else{overrides.insert((field(body,"UID").unwrap_or_default(),at.unwrap()));}
+    }}
     let mut events=Vec::new();
-    for body in blocks {
-        let raw=format!("BEGIN:VEVENT{body}END:VEVENT");
-        let Some(base)=crate::mail::meetings_of(&raw).into_iter().next() else{
-            if field(&body,"STATUS").is_some_and(|s|s.split_once(':').is_some_and(|(_,v)|v.trim().eq_ignore_ascii_case("CANCELLED"))){continue;}
-            return Err(Failure::text("服务器返回了日程，但时间或时区无法解析，未完成同步"));
+    let mut seen=std::collections::HashSet::new();
+    let mut add_event=|event:crate::mail::Meeting,report:&mut ReadReport|{
+        if event.start>=hi.timestamp() || event.end.unwrap_or(event.start+1)<=lo.timestamp(){
+            report.outside+=1;
+        }else if seen.insert(dedupe_key(&event)){
+            if events.len()==5000 {report.limited=true;return false;}
+            events.push(event);
+        }
+        true
+    };
+    'blocks: for body in blocks{
+        if field(&body,"UID").is_some_and(|uid|invalid_series.contains(&uid)){report.invalid+=1;continue;}
+        if cancelled(&body){report.cancelled+=1;continue;}
+        let Some(base)=crate::mail::meetings_of(&format!("BEGIN:VEVENT\n{body}END:VEVENT")).into_iter().next()else{
+            report.invalid+=1;report.problem("部分日程的时间或时区无法解析");continue;
         };
-        if field(&body,"RECURRENCE-ID").is_some() || field(&body,"RRULE").is_none() {
-            if field(&body,"RECURRENCE-ID").is_some() || !overrides.contains(&(field(&body,"UID").unwrap_or_default(),base.start)){events.push(base);}
+        if field(&body,"RECURRENCE-ID").is_some()||field(&body,"RRULE").is_none(){
+            if (field(&body,"RECURRENCE-ID").is_some()||!overrides.contains(&(field(&body,"UID").unwrap_or_default(),base.start))) && !add_event(base,&mut report){break;}
             continue;
         }
         let mut rules=Vec::new();let mut nested=0;
         for line in body.lines(){
-            if line.starts_with("BEGIN:"){nested+=1;continue;}
-            if line.starts_with("END:"){nested-=1;continue;}
+            if line.starts_with("BEGIN:"){nested+=1;continue;}if line.starts_with("END:"){nested-=1;continue;}
             if nested==0 && matches!(line.split([';',':']).next(),Some("DTSTART"|"RRULE"|"RDATE"|"EXDATE")){rules.push(line);}
         }
-        let set:rrule::RRuleSet=rules.join("\n").parse().map_err(|_|Failure::text("无法解析服务器的重复日程规则"))?;
+        let Ok(set)=rules.join("\n").parse::<rrule::RRuleSet>()else{report.invalid+=1;report.problem("部分日程的重复规则无法解析");continue;};
         let duration=base.end.map_or(0,|end|end-base.start);
         let result=set.after((lo-chrono::Duration::seconds(duration.max(1))).with_timezone(&rrule::Tz::UTC)).before(hi.with_timezone(&rrule::Tz::UTC)).all(2000);
-        if result.limited{return Err(Failure::text("重复日程数量过多，无法完整同步当前时间范围"));}
+        report.limited|=result.limited;if result.dates.is_empty(){report.outside+=1;}
         let uid=field(&body,"UID").unwrap_or_default();
-        for date in result.dates {
+        for date in result.dates{
             let start=date.timestamp();if overrides.contains(&(uid.clone(),start)){continue;}
             let mut event=base.clone();event.start=start;event.end=base.end.map(|end|start+end-base.start);
-            event.at=date.with_timezone(&chrono::Local).format(if event.all_day {"%m-%d 全天"}else{"%m-%d %H:%M"}).to_string();events.push(event);
+            event.at=date.with_timezone(&chrono::Local).format(if event.all_day{"%m-%d 全天"}else{"%m-%d %H:%M"}).to_string();
+            if !add_event(event,&mut report){break 'blocks;}
         }
     }
-    events.retain(|m|m.start<hi.timestamp()&&m.end.unwrap_or(m.start+1)>lo.timestamp());
-    events.sort_by_key(|m|m.start);let mut seen=std::collections::HashSet::new();events.retain(|m|seen.insert(dedupe_key(m)));Ok(events)
+    events.sort_by_key(|m|m.start);
+    ParsedEvents{events,report}
 }
 
 // ---------------------------------------------------------------- URL
@@ -932,6 +1148,8 @@ pub enum Event {
     /// 一次成功同步。
     Synced { config: Config, events: Vec<crate::mail::Meeting>, at: String },
     MonthLoaded { config: Config, month: NaiveDate, result: Result<Vec<crate::mail::Meeting>, String> },
+    /// 数据可用但不完整；成功结果之后单独更新状态，不反复弹窗。
+    Warning {config:Config,month:Option<NaiveDate>,message:String},
     /// 一次失败（界面只在连续失败时显示红字）。
     Failed { config: Config, message: String },
 }
@@ -1007,7 +1225,8 @@ fn run_with(cmd_rx: Receiver<Cmd>, ev: Sender<Event>, interval: Duration, mut sy
                             Ok(f) => {
                                 let mut saved = c.clone();
                                 saved.href = Some(f.href);
-                                (true, "连接成功".to_string(), f.events.len(), Some(saved))
+                                let warning=f.report.warning();
+                                (true,if warning.is_empty(){"连接成功".into()}else{format!("部分日程未同步：{warning}")}, f.events.len(), Some(saved))
                             }
                             Err(e) => (false, e.message, 0, None),
                         };
@@ -1043,7 +1262,9 @@ fn sync_once(
     };
     match fetch(cfg, &password) {
         Ok(f) => {
+            let warning=f.report.warning();
             let _ = ev.send(Event::Synced { config:cfg.clone(),events: f.events, at: now_label() });
+            let _ = ev.send(Event::Warning{config:cfg.clone(),month:None,message:warning});
         }
         Err(e) => {
             eprintln!("[calendar] 同步失败：{}", e.message);
@@ -1051,8 +1272,11 @@ fn sync_once(
         }
     }
     if let Some(month) = month {
-        let result = fetch_month(cfg, &password, month).map(|f| f.events).map_err(|e| e.message);
+        let fetched=fetch_month(cfg,&password,month);
+        let warning=fetched.as_ref().map(|f|f.report.warning()).unwrap_or_default();
+        let result=fetched.map(|f|f.events).map_err(|e|e.message);
         let _ = ev.send(Event::MonthLoaded { config: cfg.clone(), month, result });
+        let _ = ev.send(Event::Warning{config:cfg.clone(),month:Some(month),message:warning});
     }
 }
 
@@ -1064,7 +1288,7 @@ pub fn now_label() -> String {
 pub fn human_error(provider: Provider, status: Option<u16>) -> String {
     match status {
         Some(code) => Failure::status(provider, code).message,
-        None => Failure::transport("").message,
+        None => TransportIssue::Network.details().1.into(),
     }
 }
 
@@ -1168,7 +1392,7 @@ mod tests {
                 paths
             });
             let cfg=Config{provider,username:"synthetic".into(),href:None,server:Some(base.clone())};
-            let result=discover(&agent(),&cfg,"synthetic-password");
+            let result=discover(&agent().unwrap(),&cfg,"synthetic-password");
             stop_tx.send(()).unwrap();let paths=worker.join().unwrap();
             assert_eq!(result.unwrap(),format!("{base}dav/calendars/account/primary/"));
             assert_eq!(paths,vec!["/","/.well-known/caldav","/dav/principals/","/dav/principals/account/","/dav/calendars/account/"]);
@@ -1230,7 +1454,7 @@ mod tests {
             drop(stream);listener
         });
         let cfg=Config{provider:Provider::Custom,username:"synthetic".into(),href:None,server:Some(base)};
-        assert_eq!(discover(&agent(),&cfg,"synthetic-password").unwrap_err().status,Some(400));
+        assert_eq!(discover(&agent().unwrap(),&cfg,"synthetic-password").unwrap_err().status,Some(400));
         let listener=worker.join().unwrap();listener.set_nonblocking(true).unwrap();
         assert!(listener.accept().is_err());
     }
@@ -1294,7 +1518,7 @@ mod tests {
             write!(stream,"HTTP/1.1 207 Multi-Status\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
         });
         let cfg=Config{provider:Provider::WeCom,username:"synthetic".into(),href:None,server:Some(base)};
-        assert!(discover(&agent(),&cfg,"synthetic-password").unwrap_err().message.contains("不可信"));
+        assert!(discover(&agent().unwrap(),&cfg,"synthetic-password").unwrap_err().message.contains("不可信"));
         worker.join().unwrap();foreign.set_nonblocking(true).unwrap();assert!(foreign.accept().is_err());
     }
 
@@ -1328,8 +1552,8 @@ mod tests {
             }
         });
         let cfg=Config{provider:Provider::Feishu,username:"synthetic".into(),href:None,server:Some(base.clone())};
-        assert!(dav(&agent(),"REPORT",&base,"1","",&cfg,"secret").is_ok());
-        assert!(dav(&agent(),"REPORT",&base,"1","",&cfg,"secret").is_err());
+        assert!(dav(&agent().unwrap(),"REPORT",&base,"1","",&cfg,"secret").is_ok());
+        assert!(dav(&agent().unwrap(),"REPORT",&base,"1","",&cfg,"secret").is_err());
         worker.join().unwrap();foreign.set_nonblocking(true).unwrap();assert!(foreign.accept().is_err());
     }
 
@@ -1338,6 +1562,18 @@ mod tests {
         assert_eq!(calendar_data("<c:calendar-data><![CDATA[SUMMARY:A &amp; B]]></c:calendar-data>"),vec!["SUMMARY:A &amp; B"]);
         assert_eq!(calendar_home("<c:calendar-home-set><d:href>/calendar/?a=1&amp;b=2</d:href></c:calendar-home-set>","https://a.com/"),Some("https://a.com/calendar/?a=1&b=2".into()));
         assert_eq!(join_url("https://a.com/dav/user/","../team/"),"https://a.com/dav/team/");
+    }
+
+    #[test]
+    fn calendar_limit_counts_only_unique_events_in_range(){
+        let old="BEGIN:VEVENT\nUID:old\nDTSTART:20200101T120000Z\nSUMMARY:历史\nEND:VEVENT\n";
+        let current="BEGIN:VEVENT\nUID:today\nDTSTART:20261112T120000Z\nSUMMARY:今天\nEND:VEVENT\n";
+        let daily="BEGIN:VEVENT\nUID:daily\nDTSTART:20261113T120000Z\nRRULE:FREQ=DAILY;COUNT=2\nSUMMARY:重复\nEND:VEVENT\n";
+        let ics=format!("BEGIN:VCALENDAR\n{}{}{daily}END:VCALENDAR",old.repeat(5000),current.repeat(2));
+        let result=inspect_ics(&ics,"2026-11-01T00:00:00Z".parse().unwrap(),"2026-12-01T00:00:00Z".parse().unwrap()).unwrap();
+        assert_eq!(result.events.len(),3);
+        assert_eq!(result.report.outside,5000);
+        assert!(!result.report.limited);
     }
 
     #[test]
@@ -1638,7 +1874,7 @@ mod tests {
         assert!(Provider::Exchange.custom_server() && Provider::Exchange.server().is_empty());
         let saved=Config{provider:Provider::Exchange,username:"me@example.com".into(),href:None,server:Some("https://mail.example.com/".into())};
         assert_eq!(decode_config(&encode_config(&saved)).unwrap(),saved,"Exchange 账号的服务器地址要能保存和读回");
-        assert_eq!(Failure::transport("timed out").message, "连不上服务器，检查网络");
+        assert!(Failure::transport(&std::io::Error::from(std::io::ErrorKind::TimedOut)).message.contains("连接超时"));
         assert_eq!(Failure::status(Provider::DingTalk, 404).message, "服务器地址不对（404）");
     }
 

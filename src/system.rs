@@ -164,6 +164,35 @@ pub fn toggle_mute() -> Option<bool> {
     }
 }
 
+/// 当前会话是否锁屏。查询走 WTS（一次本机 RPC），按 2 秒缓存，避免每帧都查。
+pub fn screen_locked() -> bool {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    use windows::Win32::System::RemoteDesktop::{
+        WTSFreeMemory, WTSQuerySessionInformationW, WTSSessionInfoEx, WTSINFOEXW, WTS_CURRENT_SERVER_HANDLE,
+        WTS_CURRENT_SESSION, WTS_SESSIONSTATE_LOCK,
+    };
+    static CACHE: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, locked)) = *cache {
+        if at.elapsed() < Duration::from_secs(2) { return locked; }
+    }
+    let locked = unsafe {
+        let mut buf = windows::core::PWSTR::null();
+        let mut len = 0u32;
+        if WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTSSessionInfoEx, &mut buf, &mut len).is_ok() && !buf.is_null() {
+            let info = &*(buf.0 as *const WTSINFOEXW);
+            let locked = info.Level == 1 && info.Data.WTSInfoExLevel1.SessionFlags == WTS_SESSIONSTATE_LOCK as i32;
+            WTSFreeMemory(buf.0 as *mut core::ffi::c_void);
+            locked
+        } else {
+            false
+        }
+    };
+    *cache = Some((Instant::now(), locked));
+    locked
+}
+
 pub fn idle_seconds() -> f64 {
     unsafe {
         let mut info = LASTINPUTINFO {
@@ -179,43 +208,231 @@ pub fn idle_seconds() -> f64 {
         }
     }
 }
-pub fn fullscreen() -> Option<crate::display_layout::Bounds> {
-    unsafe {
-        let hwnd = GetForegroundWindow();
-        if hwnd.0.is_null() {
-            return None;
-        }
-        let mut pid = 0;
-        GetWindowThreadProcessId(hwnd, Some(&mut pid));
-        if pid == windows::Win32::System::Threading::GetCurrentProcessId() {
-            return None;
-        }
-        // 桌面与资源管理器桌面窗口不能当成全屏游戏。
-        let mut cls = [0u16; 64];
-        let n = GetClassNameW(hwnd, &mut cls);
-        let cls = String::from_utf16_lossy(&cls[..n.max(0) as usize]);
-        if matches!(cls.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd") {
-            return None;
-        }
-        let mut r = RECT::default();
-        if GetWindowRect(hwnd, &mut r).is_err() {
-            return None;
-        }
-        let mut info = MONITORINFO {
-            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-            ..Default::default()
-        };
-        if !GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut info).as_bool()
-        {
-            return None;
-        }
-        let covers=r.left <= info.rcMonitor.left
-            && r.top <= info.rcMonitor.top
-            && r.right >= info.rcMonitor.right
-            && r.bottom >= info.rcMonitor.bottom;
-        covers.then_some(crate::display_layout::Bounds {left:info.rcMonitor.left,top:info.rcMonitor.top,right:info.rcMonitor.right,bottom:info.rcMonitor.bottom})
+/// 前台窗口在全屏判定里需要的信息。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Foreground {
+    hwnd: isize,
+    pid: u32,
+    /// 最终所有者窗口（没有所有者时是它自己）。
+    root_owner: isize,
+    /// 会在任务栏单独显示按钮的普通程序窗口（不是工具窗口、对话框或浮动面板）。
+    app_window: bool,
+}
+
+/// 前台从全屏窗口切到别的窗口时，是否仍按原来的全屏处理（岛仔保持隐藏）。
+///
+/// 3ds Max、Photoshop 这类软件全屏时，插件面板、浮动工具条、
+/// 属性对话框都是同一个程序的附属窗口；每点一下前台就在它们和主窗口之间来回切，
+/// 过去岛仔会跟着「出现 → 消失」闪一次。只要原来的全屏窗口还盖着屏幕，
+/// 而新的前台是它的附属窗口（被它拥有，或同一程序里不单独占任务栏的窗口），就继续隐藏。
+/// 切到另一个程序、或同一程序里另开的普通窗口（如浏览器的新窗口）时照常显示。
+fn keeps_fullscreen(last: Foreground, still_covers: bool, now: Option<Foreground>) -> bool {
+    if !still_covers { return false; }
+    match now {
+        // 激活切换的瞬间前台可能是空的，不当成离开全屏。
+        None => true,
+        Some(now) => now.hwnd == last.hwnd || now.root_owner == last.hwnd || (now.pid == last.pid && !now.app_window),
     }
 }
+
+unsafe fn foreground_info(hwnd: HWND) -> Foreground {
+    let mut pid = 0;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    let root = GetAncestor(hwnd, GA_ROOTOWNER);
+    let root_owner = if root.0.is_null() { hwnd.0 as isize } else { root.0 as isize };
+    let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    let owned = !GetWindow(hwnd, GW_OWNER).unwrap_or_default().0.is_null();
+    let app_window = ex & WS_EX_APPWINDOW.0 as isize != 0 || (!owned && ex & WS_EX_TOOLWINDOW.0 as isize == 0);
+    Foreground { hwnd: hwnd.0 as isize, pid, root_owner, app_window }
+}
+
+/// 窗口盖满它所在的整块屏幕时返回该屏幕范围。
+unsafe fn covering_monitor(hwnd: HWND) -> Option<crate::display_layout::Bounds> {
+    if !IsWindow(hwnd).as_bool() || !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+        return None;
+    }
+    let mut r = RECT::default();
+    if GetWindowRect(hwnd, &mut r).is_err() {
+        return None;
+    }
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut info).as_bool()
+    {
+        return None;
+    }
+    let covers=r.left <= info.rcMonitor.left
+        && r.top <= info.rcMonitor.top
+        && r.right >= info.rcMonitor.right
+        && r.bottom >= info.rcMonitor.bottom;
+    // 任务栏自动隐藏时，普通最大化窗口的外框也可能覆盖整屏，但标题栏占掉了客户区顶部。
+    // 以客户区是否盖满整屏为准，不看样式位：有的游戏全屏时保留标题栏样式和最大化标志、
+    // 实际并不画标题栏，按样式位判断会把它们当成普通最大化（0.6.65 的无畏契约回归）。
+    if covers && IsZoomed(hwnd).as_bool() && !client_covers(hwnd, &info.rcMonitor) {
+        #[cfg(not(test))] log_maximized_exclusion(hwnd, r, info.rcMonitor);
+        return None;
+    }
+    covers.then_some(crate::display_layout::Bounds {left:info.rcMonitor.left,top:info.rcMonitor.top,right:info.rcMonitor.right,bottom:info.rcMonitor.bottom})
+}
+
+/// 客户区（不含标题栏和边框）是否盖满整块屏幕。
+unsafe fn client_covers(hwnd: HWND, monitor: &RECT) -> bool {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::ClientToScreen;
+    let mut c = RECT::default();
+    if GetClientRect(hwnd, &mut c).is_err() { return false; }
+    let (mut tl, mut br) = (POINT { x: c.left, y: c.top }, POINT { x: c.right, y: c.bottom });
+    if !ClientToScreen(hwnd, &mut tl).as_bool() || !ClientToScreen(hwnd, &mut br).as_bool() { return false; }
+    tl.x <= monitor.left && tl.y <= monitor.top && br.x >= monitor.right && br.y >= monitor.bottom
+}
+
+/// 诊断：盖满屏幕却按普通最大化处理（不隐藏岛仔）的窗口，每个窗口只记一次，便于核对用户反馈。
+#[cfg(not(test))]
+unsafe fn log_maximized_exclusion(hwnd: HWND, window: RECT, monitor: RECT) {
+    use std::sync::Mutex;
+    static LOGGED: Mutex<isize> = Mutex::new(0);
+    let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+    if *logged == hwnd.0 as isize { return; }
+    *logged = hwnd.0 as isize;
+    let mut cls = [0u16; 128];
+    let n = GetClassNameW(hwnd, &mut cls);
+    let mut c = RECT::default();
+    let _ = GetClientRect(hwnd, &mut c);
+    let line = format!("{} 普通最大化不隐藏：类名={} 样式=0x{:08x} 扩展=0x{:08x} 窗口={:?} 客户区={}×{} 屏幕={:?}",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S"), String::from_utf16_lossy(&cls[..n.max(0) as usize]),
+        GetWindowLongPtrW(hwnd, GWL_STYLE) as u32, GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32,
+        (window.left, window.top, window.right, window.bottom), c.right - c.left, c.bottom - c.top,
+        (monitor.left, monitor.top, monitor.right, monitor.bottom));
+    crate::resources::append_log(&crate::model::config_dir().join("diagnostics"), "fullscreen.log", &line);
+}
+
+pub fn fullscreen() -> Option<crate::display_layout::Bounds> {
+    use std::sync::Mutex;
+    // 上一次判定为全屏的窗口：前台切到它的附属窗口时沿用（见 `keeps_fullscreen`）。
+    static LAST: Mutex<Option<Foreground>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        let now = (!hwnd.0.is_null()).then(|| foreground_info(hwnd));
+        if let Some(info) = now {
+            // 岛仔自己的窗口（设置窗口等）不算全屏，也不沿用。
+            if info.pid == windows::Win32::System::Threading::GetCurrentProcessId() {
+                *last = None;
+                return None;
+            }
+            // 桌面与资源管理器桌面窗口不能当成全屏游戏。
+            let mut cls = [0u16; 64];
+            let n = GetClassNameW(hwnd, &mut cls);
+            let cls = String::from_utf16_lossy(&cls[..n.max(0) as usize]);
+            if matches!(cls.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd") {
+                *last = None;
+                return None;
+            }
+            if let Some(bounds) = covering_monitor(hwnd) {
+                *last = Some(info);
+                return Some(bounds);
+            }
+        }
+        if let Some(previous) = *last {
+            let bounds = covering_monitor(HWND(previous.hwnd as *mut _));
+            if keeps_fullscreen(previous, bounds.is_some(), now) {
+                return bounds;
+            }
+        }
+        *last = None;
+        None
+    }
+}
+
+#[cfg(test)]
+mod fullscreen_follow_tests {
+    use super::*;
+
+    const MAX: Foreground = Foreground { hwnd: 100, pid: 7, root_owner: 100, app_window: true };
+
+    #[test]
+    fn maximized_browser_and_borderless_fullscreen_at_the_same_bounds_are_distinct() {
+        unsafe {
+            let hwnd = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, windows::core::w!("STATIC"),
+                windows::core::w!(""), WS_OVERLAPPEDWINDOW | WS_MAXIMIZE, 0, 0, 320, 240, None, None, None, None).unwrap();
+            let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+            assert!(GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut info).as_bool());
+            let r = info.rcMonitor;
+            let cover = || SetWindowPos(hwnd, HWND_BOTTOM, r.left, r.top, r.right-r.left, r.bottom-r.top,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED).unwrap();
+            cover();
+            assert!(IsZoomed(hwnd).as_bool());
+            let maximized = covering_monitor(hwnd);
+            // Chromium 进入 F11 时移除标题栏和可调整大小的边框，仍可能保留最大化标志。
+            let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            SetWindowLongPtrW(hwnd, GWL_STYLE, style & !((WS_CAPTION | WS_THICKFRAME).0 as isize));
+            cover();
+            let fullscreen = covering_monitor(hwnd);
+            DestroyWindow(hwnd).unwrap();
+            assert!(fullscreen.is_some(), "无边框全屏仍应隐藏岛仔");
+            assert!(maximized.is_none(), "普通最大化即使盖满屏幕也应显示岛仔");
+        }
+    }
+
+    #[test]
+    fn game_that_keeps_caption_style_but_draws_no_caption_still_hides_the_island() {
+        use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+        unsafe extern "system" fn proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+            // 不留非客户区：样式里有标题栏，但客户区就是整个窗口（自绘或无边框全屏的游戏）。
+            if m == WM_NCCALCSIZE && w.0 != 0 { return LRESULT(0); }
+            DefWindowProcW(h, m, w, l)
+        }
+        unsafe {
+            let class = windows::core::w!("DaozaiCaptionlessGame");
+            let wc = WNDCLASSW { lpfnWndProc: Some(proc), lpszClassName: class, ..Default::default() };
+            RegisterClassW(&wc);
+            let hwnd = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, class, windows::core::w!(""),
+                WS_OVERLAPPEDWINDOW | WS_MAXIMIZE, 0, 0, 320, 240, None, None, None, None).unwrap();
+            let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+            assert!(GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut info).as_bool());
+            let r = info.rcMonitor;
+            SetWindowPos(hwnd, HWND_BOTTOM, r.left, r.top, r.right-r.left, r.bottom-r.top,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED).unwrap();
+            let zoomed = IsZoomed(hwnd).as_bool();
+            let captioned = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & WS_CAPTION.0 == WS_CAPTION.0;
+            let result = covering_monitor(hwnd);
+            DestroyWindow(hwnd).unwrap();
+            assert!(zoomed && captioned, "复现条件：最大化且保留标题栏样式");
+            assert!(result.is_some(), "客户区盖满整屏的全屏游戏应隐藏岛仔");
+        }
+    }
+
+    #[test]
+    fn plugin_panels_and_dialogs_of_the_fullscreen_app_keep_the_island_hidden() {
+        // 被主窗口拥有的插件面板 / 对话框
+        let owned = Foreground { hwnd: 200, pid: 7, root_owner: 100, app_window: false };
+        assert!(keeps_fullscreen(MAX, true, Some(owned)));
+        // 同一程序里不占任务栏的浮动工具窗口（没有设所有者）
+        let tool = Foreground { hwnd: 201, pid: 7, root_owner: 201, app_window: false };
+        assert!(keeps_fullscreen(MAX, true, Some(tool)));
+        // 插件放在独立进程里、但窗口挂在主窗口下面
+        let other_process = Foreground { hwnd: 202, pid: 9, root_owner: 100, app_window: false };
+        assert!(keeps_fullscreen(MAX, true, Some(other_process)));
+        // 激活切换瞬间前台为空
+        assert!(keeps_fullscreen(MAX, true, None));
+    }
+
+    #[test]
+    fn switching_to_another_app_or_leaving_fullscreen_shows_the_island() {
+        let other_app = Foreground { hwnd: 300, pid: 9, root_owner: 300, app_window: true };
+        assert!(!keeps_fullscreen(MAX, true, Some(other_app)), "切到别的程序时照常显示");
+        // 同一程序新开的普通窗口（如浏览器的第二个窗口）也照常显示
+        let second_window = Foreground { hwnd: 301, pid: 7, root_owner: 301, app_window: true };
+        assert!(!keeps_fullscreen(MAX, true, Some(second_window)));
+        // 原来的全屏窗口已经还原、最小化或关闭
+        let owned = Foreground { hwnd: 200, pid: 7, root_owner: 100, app_window: false };
+        assert!(!keeps_fullscreen(MAX, false, Some(owned)));
+        assert!(!keeps_fullscreen(MAX, false, None));
+    }
+}
+
 pub(crate) fn is_browser_process(name:&str)->bool {
     ["chrome.exe","msedge.exe","firefox.exe","brave.exe","vivaldi.exe","opera.exe",
         "arc.exe","zen.exe","chromium.exe","librewolf.exe","floorp.exe","waterfox.exe",
@@ -249,39 +466,107 @@ fn window_covers_side(window:RECT,island:RECT,dock:crate::model::Dock)->bool {
 pub fn browser_at_top(island:HWND,settings:&crate::model::Settings)->Option<bool> {
     unsafe {
         let foreground=GetForegroundWindow();
-        if foreground.0.is_null(){return None;}
+        if foreground.0.is_null(){return Some(false);}
         let mut pid=0;
         GetWindowThreadProcessId(foreground,Some(&mut pid));
         // 设置、托盘和岛内输入沿用此前的避让状态，避免自身窗口引起反复切换。
-        if pid==0 || pid==GetCurrentProcessId(){return None;}
-        let mut browser_rect=RECT::default();let mut island_rect=RECT::default();
-        if GetWindowRect(foreground,&mut browser_rect).is_err() || GetWindowRect(island,&mut island_rect).is_err(){return None;}
-        if !browser_overlaps_island(browser_rect,island_rect,settings.dock){return Some(false);}
-        let Ok(process)=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,false,pid) else{return Some(false)};
-        let mut path=[0u16;1024];let mut length=path.len() as u32;
-        let result=QueryFullProcessImageNameW(process,PROCESS_NAME_WIN32,PWSTR(path.as_mut_ptr()),&mut length);
-        let _=CloseHandle(process);
-        if result.is_err(){return Some(false);}
-        let path=String::from_utf16_lossy(&path[..length as usize]);
-        Some(avoidance_matches(&path,settings))
+        if pid==GetCurrentProcessId(){return None;}
+        if pid==0{return Some(false);}
+        thread_local! { static LAST_MAIN: std::cell::Cell<Option<(HWND,u32)>> = const { std::cell::Cell::new(None) }; }
+        LAST_MAIN.with(|last| avoidance_for_window(foreground,island,pid,settings,last))
     }
+}
+
+unsafe fn visible_avoidance_rect(hwnd:HWND)->Option<RECT> {
+    if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool(){return None;}
+    let mut cloaked=0u32;
+    let _=windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(hwnd,windows::Win32::Graphics::Dwm::DWMWA_CLOAKED,(&mut cloaked as *mut u32).cast(),4);
+    if cloaked!=0{return None;}
+    let mut rect=RECT::default();
+    GetWindowRect(hwnd,&mut rect).ok()?;
+    Some(rect)
+}
+
+unsafe fn process_image_path(pid:u32)->Option<String> {
+    let process=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,false,pid).ok()?;
+    let mut path=vec![0u16;32768];let mut length=path.len() as u32;
+    let result=QueryFullProcessImageNameW(process,PROCESS_NAME_WIN32,PWSTR(path.as_mut_ptr()),&mut length);
+    let _=CloseHandle(process);
+    result.ok()?;
+    Some(String::from_utf16_lossy(&path[..length as usize]))
+}
+
+// 无所有者的工具窗可能在岛仔启动时就已打开。只有同进程的主窗口唯一时才补认宿主。
+unsafe fn unique_main_window(pid:u32)->Option<HWND> {
+    use windows::Win32::Foundation::{BOOL,LPARAM};
+    struct Search { pid:u32, main:Option<HWND> }
+    unsafe extern "system" fn visit(hwnd:HWND,param:LPARAM)->BOOL {
+        let search=&mut *(param.0 as *mut Search);
+        let mut pid=0;GetWindowThreadProcessId(hwnd,Some(&mut pid));
+        if pid==search.pid && foreground_info(hwnd).app_window && visible_avoidance_rect(hwnd).is_some() {
+            if search.main.is_some(){search.main=None;return BOOL(0);}
+            search.main=Some(hwnd);
+        }
+        BOOL(1)
+    }
+    let mut search=Search{pid,main:None};
+    EnumWindows(Some(visit),LPARAM((&mut search as *mut Search) as isize)).ok()?;
+    search.main
+}
+
+unsafe fn avoidance_for_window(foreground:HWND,island:HWND,pid:u32,settings:&crate::model::Settings,last:&std::cell::Cell<Option<(HWND,u32)>>)->Option<bool> {
+    if !settings.browser_minimal || IsIconic(GetAncestor(foreground,GA_ROOTOWNER)).as_bool(){return Some(false);}
+    let Some(rect)=visible_avoidance_rect(foreground) else{return Some(false)};
+    let mut island_rect=RECT::default();GetWindowRect(island,&mut island_rect).ok()?;
+    let overlaps=|rect|browser_overlaps_island(rect,island_rect,settings.dock);
+    let owner=GetWindow(foreground,GW_OWNER).ok();
+    let info=foreground_info(foreground);
+    if owner.is_none() && info.app_window {last.set(Some((foreground,pid)));}
+    else if last.get().is_some_and(|(_,prev)|prev!=pid){last.set(None);}
+    let path=std::cell::LazyCell::new(||process_image_path(pid));
+    if overlaps(rect) && path.as_deref().is_some_and(|p|avoidance_matches(p,settings)){return Some(true);}
+    if settings.avoid_apps.is_empty(){return Some(false);}
+
+    // 所有者关系可以跨进程，嵌套对话框也沿这条链找到实际遮挡岛的名单窗口。
+    let listed=|p:&str|crate::avoidance::contains_app(&settings.avoid_apps,p);
+    let mut parent=owner;
+    while let Some(hwnd)=parent {
+        if IsIconic(hwnd).as_bool(){return Some(false);}
+        if visible_avoidance_rect(hwnd).is_some_and(overlaps) {
+            let mut owner_pid=0;GetWindowThreadProcessId(hwnd,Some(&mut owner_pid));
+            let registered=if owner_pid==pid {path.as_deref().is_some_and(listed)}
+                else {process_image_path(owner_pid).as_deref().is_some_and(listed)};
+            if registered{
+                if foreground_info(hwnd).app_window {last.set(Some((hwnd,owner_pid)));}
+                return Some(true);
+            }
+        }
+        parent=GetWindow(hwnd,GW_OWNER).ok();
+    }
+    if owner.is_some() || info.app_window || !path.as_deref().is_some_and(listed){return Some(false);}
+    // 部分插件工具窗未登记 owner。优先跟随刚才操作的同进程主窗口，每次重新检查其位置。
+    let host=match last.get() {
+        Some((hwnd,prev)) if prev==pid && foreground_info(hwnd).pid==pid=>Some(hwnd),
+        _=>unique_main_window(pid),
+    };
+    Some(host.and_then(|hwnd|visible_avoidance_rect(hwnd)).is_some_and(overlaps))
 }
 
 pub enum Incoming {
     Revoked,
     Status(String),
-    Message(String, String, String),
+    Message(String, String, String, Option<crate::messenger::Target>),
 }
-#[path="qq_toast_source.rs"]
-mod qq_toast_source;
+#[path="toast_source.rs"]
+mod toast_source;
 
-fn notification_identity(n:&UserNotification, number:u32, created:i64, known_qq:bool)->(String,String){
-    if known_qq{return ("QQ".into(),"QQ".into());}
+fn notification_identity(n:&UserNotification,number:u32,created:i64,known:Option<crate::messenger::Messenger>)->(String,String){
+    use crate::messenger::Messenger;
     let info=n.AppInfo().ok();
     let id=info.as_ref().and_then(|app|app.AppUserModelId().ok()).map(|id|id.to_string()).unwrap_or_default();
-    if id.eq_ignore_ascii_case("QQ") || (id.is_empty() && qq_toast_source::matches(number,created)){
-        return ("QQ".into(),"QQ".into());
-    }
+    let client=if !id.is_empty(){Messenger::from_notification_id(&id)}
+        else{known.or_else(||toast_source::sender(number,created).and_then(|id|Messenger::from_notification_id(&id)))};
+    if let Some(client)=client{return (client.name().into(),client.adapter().notification_id.into());}
     let name=info.and_then(|app|app.DisplayInfo().ok()).and_then(|display|display.DisplayName().ok())
         .map(|name|name.to_string()).filter(|name|!name.trim().is_empty()).unwrap_or_else(||"Windows 通知".into());
     let id=if id.is_empty(){name.clone()}else{id};
@@ -299,55 +584,93 @@ fn notification_body(n: &UserNotification) -> Result<String> {
     }
     Ok(parts.join(" · "))
 }
-fn is_wechat_toast(app:&str,id:&str)->bool{
-    ["微信","WeChat","Weixin"].iter().any(|name|app.trim().eq_ignore_ascii_case(name))
-        || ["WeChat","Weixin","Tencent.WeChat","Tencent.Weixin"].iter().any(|name|id.eq_ignore_ascii_case(name))
-}
 /// 停止信号独立于消息队列，断开后结束等待，不再读取通知。
 pub struct Notifications {
     incoming: Receiver<Incoming>,
     stop: mpsc::Sender<()>,
+    taskbar_mask:std::sync::Arc<std::sync::atomic::AtomicU8>,
 }
 impl Notifications {
     pub fn try_recv(&self)->std::result::Result<Incoming,mpsc::TryRecvError>{self.incoming.try_recv()}
+    pub fn taskbar_settings(&self,settings:&crate::model::Settings){self.taskbar_mask.store(crate::messenger::toast_suppression(settings),std::sync::atomic::Ordering::Relaxed);}
 }
 impl Drop for Notifications {fn drop(&mut self){let _=self.stop.send(());}}
 
 #[derive(Clone,Copy,PartialEq,Eq)]
-struct ToastVersion { created:i64, qq_body:Option<u64> }
+enum ToastBody {Skipped,Unavailable,Read(u64)}
+#[derive(Clone,Copy,PartialEq,Eq)]
+struct ToastVersion { created:i64, client:Option<crate::messenger::Messenger>, body:ToastBody }
 impl ToastVersion {
-    fn new(created:i64,qq_body:Option<&str>)->Self{
-        Self{created,qq_body:qq_body.map(|body|{let mut hash=std::collections::hash_map::DefaultHasher::new();body.hash(&mut hash);hash.finish()})}
+    fn new(created:i64,client:Option<crate::messenger::Messenger>,body:Option<&str>)->Self{
+        Self{created,client,body:body.map(|body|{let mut hash=std::collections::hash_map::DefaultHasher::new();body.hash(&mut hash);ToastBody::Read(hash.finish())}).unwrap_or(ToastBody::Skipped)}
     }
 }
-#[derive(Default)]
-struct NotificationBaseline { previous: Option<HashMap<u32,ToastVersion>> }
+struct NotificationBaseline { previous:Option<HashMap<u32,ToastVersion>>,started:i64,primed:bool }
+impl Default for NotificationBaseline {
+    fn default()->Self{
+        let started=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()
+            .and_then(|time|i64::try_from(time.as_nanos()/100+116444736000000000).ok()).unwrap_or(i64::MAX);
+        Self{previous:None,started,primed:false}
+    }
+}
 impl NotificationBaseline {
     fn unchanged_other(&self,id:u32,created:i64)->Option<ToastVersion>{
-        self.previous.as_ref()?.get(&id).copied().filter(|old|old.created==created && old.qq_body.is_none())
+        self.previous.as_ref()?.get(&id).copied().filter(|old|old.created==created && old.client.is_none() && old.body==ToastBody::Skipped)
     }
     fn changed(&self,id:u32,version:ToastVersion)->bool{
-        self.previous.as_ref().is_some_and(|old|old.get(&id)!=Some(&version))
+        let Some(previous)=&self.previous else{return version.created>self.started;};
+        let Some(old)=previous.get(&id) else{return self.primed || version.created>self.started;};
+        if old.created!=version.created{return true;}
+        // 未读取、读取失败后的首次成功只建立指纹，避免通道切换和恢复读取时重放旧通知。
+        matches!((old.body,version.body),(ToastBody::Read(before),ToastBody::Read(after)) if before!=after)
+    }
+    fn finish(&mut self,mut current:HashMap<u32,ToastVersion>,complete:bool){
+        if !complete{if let Some(previous)=&self.previous{for (&id,&old) in previous{current.entry(id).or_insert(old);}}}
+        self.previous=Some(current);self.primed|=complete;
+    }
+    fn observe(&self,id:u32,created:i64,client:Option<crate::messenger::Messenger>,tracked:bool,body:Result<String>)->(ToastVersion,Option<String>){
+        let body=match body{
+            Ok(body)=>body,
+            Err(_)=>{
+                if let Some(old)=self.previous.as_ref().and_then(|items|items.get(&id)).filter(|old|old.created==created && old.client==client){return (*old,None);}
+                let version=ToastVersion{created,client,body:ToastBody::Unavailable};
+                // 已确认是新通知时仍给通用提醒；恢复正文后只补指纹，不重复弹出。
+                let message=self.changed(id,version).then(||if tracked{"有新消息".into()}else{"收到新通知".into()});
+                return (version,message);
+            }
+        };
+        let version=ToastVersion::new(created,client,tracked.then_some(body.as_str()));
+        let message=self.changed(id,version).then(||if tracked && body.trim().is_empty(){"有新消息".into()}else{body});
+        (version,message)
     }
 }
 
-fn qq_channel_status()->String{
+fn channel_status(client:crate::messenger::Messenger)->String{
     use windows::UI::Notifications::{NotificationSetting,ToastNotificationManager};
-    match ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from("QQ")).and_then(|notifier|notifier.Setting()){
-        Ok(NotificationSetting::Enabled)=>"QQ 系统通知通道可用".into(),
-        Ok(NotificationSetting::DisabledForApplication)=>"QQ 系统通知已关闭，请在 Windows 通知设置中开启后重新连接".into(),
+    let name=client.name();
+    match ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(client.adapter().notification_id)).and_then(|notifier|notifier.Setting()){
+        Ok(NotificationSetting::Enabled)=>format!("{name} 系统通知通道可用"),
+        Ok(NotificationSetting::DisabledForApplication)=>format!("{name} 系统通知已关闭，请在 Windows 通知设置中开启后重新连接"),
         Ok(NotificationSetting::DisabledForUser)=>"Windows 系统通知已关闭，请开启后重新连接".into(),
         Ok(NotificationSetting::DisabledByGroupPolicy)=>"系统策略禁止通知".into(),
-        _=>"QQ 系统通知通道未就绪，请检查 QQ 安装和通知设置后重新连接".into(),
+        _=>format!("{name} 系统通知通道未就绪，请检查安装和通知设置后重新连接"),
     }
 }
 
 /// 必须由窗口线程发起权限请求，后台仅读取新增或更新的通知。
-pub fn connect(ctx:eframe::egui::Context,qq_only:bool) -> Result<Notifications> {
+pub fn connect(ctx:eframe::egui::Context,filter:crate::messenger::NotificationFilter) -> Result<Notifications> {
+    connect_inner(ctx,filter,crate::messenger::toast_suppression(&crate::model::Settings::default()))
+}
+pub fn connect_with_settings(ctx:eframe::egui::Context,settings:&crate::model::Settings)->Result<Notifications>{
+    connect_inner(ctx,crate::messenger::NotificationFilter::for_settings(settings),crate::messenger::toast_suppression(settings))
+}
+fn connect_inner(ctx:eframe::egui::Context,filter:crate::messenger::NotificationFilter,mask:u8)->Result<Notifications>{
+    let baseline=NotificationBaseline::default();
     let listener = UserNotificationListener::Current()?;
     let request = listener.RequestAccessAsync()?;
     let (tx, rx) = mpsc::sync_channel(32);
     let (stop, stopped)=mpsc::channel();
+    let taskbar_mask=std::sync::Arc::new(std::sync::atomic::AtomicU8::new(mask));let worker_mask=taskbar_mask.clone();
     std::thread::Builder::new().name("daozai-notifications".into()).spawn(move || {
         let send=|event|{
             let result=tx.send(event);
@@ -365,44 +688,62 @@ pub fn connect(ctx:eframe::egui::Context,qq_only:bool) -> Result<Notifications> 
                 return Ok(());
             }
             let listener = UserNotificationListener::Current()?;
-            let qq_status=qq_channel_status();
-            let mut baseline=NotificationBaseline::default();
+            let channels=crate::messenger::Messenger::ALL.into_iter().filter(|client|client.adapter().capture==crate::messenger::Capture::SystemToast)
+                .filter(|client|filter.allows(client.adapter().notification_id)).map(channel_status).collect::<Vec<_>>().join("\n");
+            let mut baseline=baseline;
+            let mut accounts=crate::messenger::ToastAccounts::default();accounts.sample();
             let mut last_status=String::new();
             loop {
                 if stopped.try_recv()!=Err(mpsc::TryRecvError::Empty){return Ok(());}
-                if listener.GetAccessStatus()? != UserNotificationListenerAccessStatus::Allowed {
-                    send(Incoming::Revoked);
-                    send(Incoming::Status("通知权限已被关闭".into()));
-                    return Ok(());
-                }
-                let items=listener.GetNotificationsAsync(NotificationKinds::Toast)?.get()?;
+                let (items,count)=match listener.GetAccessStatus().and_then(|access|{
+                    if access!=UserNotificationListenerAccessStatus::Allowed{return Ok(None);}
+                    let items=listener.GetNotificationsAsync(NotificationKinds::Toast)?.get()?;let count=items.Size()?;
+                    Ok(Some((items,count)))
+                }){
+                    Ok(Some(items))=>items,
+                    Ok(None)=>{send(Incoming::Revoked);send(Incoming::Status("通知权限已被关闭".into()));return Ok(());}
+                    Err(error)=>{
+                        let status=format!("Windows 通知暂时读取失败：{} · 将自动重试",error.code());
+                        if status!=last_status{send(Incoming::Status(status.clone()));last_status=status;}
+                        if stopped.recv_timeout(std::time::Duration::from_secs(2))!=Err(mpsc::RecvTimeoutError::Timeout){return Ok(());}
+                        continue;
+                    }
+                };
+                accounts.sample();
                 let mut current=HashMap::new();
+                let mut complete=true;
                 let mut messages=Vec::new();
-                for i in 0..items.Size()? {
-                    let Ok(n)=items.GetAt(i) else{continue};
-                    let (Ok(number),Ok(created))=(n.Id(),n.CreationTime()) else{continue};
+                for i in 0..count {
+                    let Ok(n)=items.GetAt(i) else{complete=false;continue};
+                    let (Ok(number),Ok(created))=(n.Id(),n.CreationTime()) else{complete=false;continue};
                     let created=created.UniversalTime;
                     if let Some(old)=baseline.unchanged_other(number,created){current.insert(number,old);continue;}
-                    let known_qq=baseline.previous.as_ref().and_then(|old|old.get(&number)).is_some_and(|old|old.created==created && old.qq_body.is_some());
-                    let (app,id)=notification_identity(&n,number,created,known_qq);
+                    let known=baseline.previous.as_ref().and_then(|old|old.get(&number)).filter(|old|old.created==created).and_then(|old|old.client);
+                    let (app,id)=notification_identity(&n,number,created,known);
                     // 微信只走任务栏事件，即使客户端同时发送系统通知也不读取其正文。
-                    if (qq_only && id!="QQ") || is_wechat_toast(&app,&id){current.insert(number,ToastVersion::new(created,None));continue;}
-                    let qq=id=="QQ";
-                    // QQ 可能原地更新同一条通知；其他应用的启动历史不需要读取正文。
-                    let body=if qq || baseline.previous.is_some(){notification_body(&n).unwrap_or_default()}else{String::new()};
-                    let version=ToastVersion::new(created,qq.then_some(body.as_str()));
+                    let client=crate::messenger::Messenger::from_notification_id(&id);
+                    if !filter.allows(&id) || crate::messenger::suppresses_toast(&app,&id,worker_mask.load(std::sync::atomic::Ordering::Relaxed)){current.insert(number,ToastVersion::new(created,client,None));continue;}
+                    let tracked=client.is_some();
+                    // 已适配客户端同时检查正文变化；其他应用的启动历史不需要读取正文。
+                    let body=if tracked || baseline.previous.is_some() || created>baseline.started{notification_body(&n)}else{Ok(String::new())};
+                    let (version,body)=baseline.observe(number,created,client,tracked,body);
                     current.insert(number,version);
-                    if baseline.changed(number,version){
-                        let body=if qq && body.trim().is_empty(){"有新消息".into()}else{body};
-                        if !body.trim().is_empty(){messages.push((created,app,id,body));}
+                    if let Some(body)=body{
+                        let target=client.filter(|client|client.adapter().capture==crate::messenger::Capture::SystemToast).map(|client|(client,accounts.target(client,number,created)))
+                            .and_then(|(client,target)|{
+                                if target.is_none(){crate::messenger::windows::trace(format!("通知 {id}·创建 {created} 未能绑定 {} 账号",client.name()));}
+                                target
+                            });
+                        if !body.trim().is_empty(){messages.push((created,app,id,body,target));}
                     }
                 }
-                baseline.previous=Some(current);
+                baseline.finish(current,complete);
+                accounts.retain(|client,id,created|baseline.previous.as_ref().and_then(|items|items.get(&id)).is_some_and(|item|item.created==created && item.client==Some(client)));
                 messages.sort_by_key(|item|item.0);
-                for (_,app,id,body) in messages {
-                    if !send(Incoming::Message(app,id,body)){return Ok(());}
+                for (_,app,id,body,target) in messages {
+                    if !send(Incoming::Message(app,id,body,target)){return Ok(());}
                 }
-                let status=if qq_only{format!("仅监听 QQ · {qq_status}")}else{format!("正在监听 Windows 通知 · 当前可见 {} 条\n{qq_status}",items.Size()?)};
+                let status=match filter{crate::messenger::NotificationFilter::Only(client)=>format!("仅监听 {} · {channels}",client.name()),crate::messenger::NotificationFilter::All=>format!("正在监听 Windows 通知 · 当前可见 {count} 条\n{channels}")};
                 if status!=last_status {
                     if !send(Incoming::Status(status.clone())){return Ok(());}
                     last_status=status;
@@ -414,7 +755,7 @@ pub fn connect(ctx:eframe::egui::Context,qq_only:bool) -> Result<Notifications> 
             send(Incoming::Status(format!("Windows 暂不允许读取通知：{}。请检查通知访问权限与应用身份。",e.code())));
         }
     }).map_err(|_|windows::core::Error::from_win32())?;
-    Ok(Notifications{incoming:rx,stop})
+    Ok(Notifications{incoming:rx,stop,taskbar_mask})
 }
 
 pub fn pick_files() -> Result<Vec<std::path::PathBuf>> {
@@ -488,22 +829,75 @@ mod tests {
     use super::*;
     #[test]
     fn notifications_skip_history_but_detect_reused_ids_and_updated_content(){
-        let mut baseline=NotificationBaseline::default();
-        let first=ToastVersion::new(10,Some("第一条"));
+        let mut baseline=NotificationBaseline{primed:true,..Default::default()};
+        let first=ToastVersion::new(10,Some(crate::messenger::Messenger::Qq),Some("第一条"));
         assert!(!baseline.changed(1,first));
-        baseline.previous=Some(HashMap::from([(1,first),(2,ToastVersion::new(10,None))]));
+        baseline.previous=Some(HashMap::from([(1,first),(2,ToastVersion::new(10,None,None))]));
         assert!(!baseline.changed(1,first));
-        assert!(baseline.changed(1,ToastVersion::new(10,Some("第二条"))));
-        assert!(baseline.changed(1,ToastVersion::new(11,Some("第一条"))));
+        assert!(baseline.changed(1,ToastVersion::new(10,Some(crate::messenger::Messenger::Qq),Some("第二条"))));
+        assert!(baseline.changed(1,ToastVersion::new(11,Some(crate::messenger::Messenger::Qq),Some("第一条"))));
         assert!(baseline.unchanged_other(2,10).is_some());
         assert!(baseline.unchanged_other(1,10).is_none());
         assert!(baseline.unchanged_other(2,11).is_none());
         baseline.previous=Some(HashMap::new());assert!(baseline.changed(1,first));
     }
     #[test]
+    fn notifications_arriving_during_connection_are_not_treated_as_old_history(){
+        let baseline=NotificationBaseline{previous:None,started:100,primed:false};
+        let (_,message)=baseline.observe(1,101,Some(crate::messenger::Messenger::Qq),true,Ok("连接期间的新消息".into()));
+        assert!(message.is_some(),"连接期间才到达的新通知不能混入启动历史而漏报");
+    }
+    #[test]
+    fn notifications_read_failures_do_not_replay_an_unchanged_qq_message(){
+        let client=Some(crate::messenger::Messenger::Qq);
+        let original=ToastVersion::new(10,client,Some("同一条消息"));
+        let baseline=NotificationBaseline{previous:Some(HashMap::from([(1,original)])),..Default::default()};
+        let (version,message)=baseline.observe(1,10,client,true,Err(windows::core::Error::from_win32()));
+        assert!(message.is_none(),"临时读取失败不能变成空正文更新而重复提醒");
+        assert!(version==original,"读取失败时保留上一轮指纹");
+    }
+    #[test]
+    fn notifications_unreadable_new_toasts_remind_once_and_historical_toasts_stay_silent(){
+        let client=Some(crate::messenger::Messenger::Qq);
+        for (created,expected) in [(90,false),(110,true)]{
+            let mut baseline=NotificationBaseline{previous:None,started:100,primed:false};
+            let (version,message)=baseline.observe(1,created,client,true,Err(windows::core::Error::from_win32()));
+            assert_eq!(message.is_some(),expected,"历史与连接期间的新通知必须区分");
+            baseline.previous=Some(HashMap::from([(1,version)]));
+            let (version,message)=baseline.observe(1,created,client,true,Ok("恢复后的正文".into()));
+            assert!(message.is_none(),"正文恢复不能重弹同一条通知");
+            baseline.previous=Some(HashMap::from([(1,version)]));
+            assert!(baseline.observe(1,created,client,true,Ok("下一条消息".into())).1.is_some());
+        }
+    }
+    #[test]
+    fn notifications_office_channel_switch_does_not_replay_but_later_body_updates_remind(){
+        for client in crate::messenger::Messenger::OFFICE{
+            let mut baseline=NotificationBaseline{previous:Some(HashMap::from([(1,ToastVersion::new(10,Some(client),None))])),started:0,primed:true};
+            assert!(baseline.unchanged_other(1,10).is_none(),"办公软件的捕获通道会切换，不能永久跳过");
+            let (version,message)=baseline.observe(1,10,Some(client),true,Ok("切换前的旧消息".into()));
+            assert!(message.is_none());baseline.previous=Some(HashMap::from([(1,version)]));
+            assert!(baseline.observe(1,10,Some(client),true,Ok("切换后的新消息".into())).1.is_some());
+        }
+    }
+    #[test]
+    fn notifications_partial_snapshots_do_not_replay_old_items_or_drop_new_items(){
+        let client=Some(crate::messenger::Messenger::Qq);
+        let old=ToastVersion::new(90,client,Some("启动前的旧通知"));let fresh=ToastVersion::new(110,client,Some("连接后的新通知"));
+        let mut baseline=NotificationBaseline{previous:None,started:100,primed:false};
+        assert!(baseline.changed(2,fresh));baseline.finish(HashMap::from([(2,fresh)]),false);
+        assert!(!baseline.changed(1,old),"首次只读到部分条目时，补读到的启动历史不能重放");
+        assert!(!baseline.changed(2,fresh));baseline.finish(HashMap::from([(1,old),(2,fresh)]),true);
+        baseline.finish(HashMap::from([(2,fresh)]),false);
+        assert!(!baseline.changed(1,old),"临时漏读条目不能被当成移除后重新新增");
+        let next=ToastVersion::new(120,client,Some("下一条"));assert!(baseline.changed(3,next));
+        baseline.finish(HashMap::new(),true);
+        assert!(baseline.previous.as_ref().unwrap().is_empty(),"成功读完整空列表后应清理历史，不能永久保留");
+    }
+    #[test]
     fn notifications_disconnect_signals_stop_without_waiting_for_new_messages(){
         let (_tx,incoming)=mpsc::sync_channel(32);let (stop,stopped)=mpsc::channel();
-        drop(Notifications{incoming,stop});
+        drop(Notifications{incoming,stop,taskbar_mask:std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0))});
         assert_eq!(stopped.try_recv(),Ok(()));
     }
     #[test]
@@ -612,12 +1006,7 @@ pub(crate) fn avoidance_windows()->std::result::Result<Vec<crate::avoidance::Can
         if len==0{return BOOL(1);}
         let mut pid=0;GetWindowThreadProcessId(hwnd,Some(&mut pid));
         if pid==GetCurrentProcessId(){return BOOL(1);}
-        let Ok(process)=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,false,pid)else{return BOOL(1)};
-        let mut path=[0u16;32768];let mut length=path.len() as u32;
-        let result=QueryFullProcessImageNameW(process,PROCESS_NAME_WIN32,PWSTR(path.as_mut_ptr()),&mut length);
-        let _=CloseHandle(process);
-        if result.is_err(){return BOOL(1);}
-        let path=String::from_utf16_lossy(&path[..length as usize]);
+        let Some(path)=process_image_path(pid) else{return BOOL(1)};
         let items=&mut *(param.0 as *mut Vec<crate::avoidance::Candidate>);
         if items.iter().any(|a|crate::avoidance::same_app(&a.path,&path)){return BOOL(1);}
         let filename=std::path::Path::new(&path).file_name().and_then(|s|s.to_str()).unwrap_or("");
@@ -651,6 +1040,65 @@ fn executable_description(path:&str)->Option<String> {
 #[cfg(test)]
 mod avoidance_tests {
     use super::*;
+    #[test]
+    fn registered_app_keeps_avoidance_when_its_plugin_panel_takes_focus() {
+        unsafe {
+            let create=|x,y,width,height,owner,ex| CreateWindowExW(WS_EX_NOACTIVATE|ex,windows::core::w!("STATIC"),
+                windows::core::w!(""),WS_POPUP|WS_VISIBLE,x-10000,y-10000,width,height,owner,None,None,None).unwrap();
+            let island=create(0,0,960,100,None,WS_EX_TOOLWINDOW);
+            let host=create(0,0,1920,1080,None,WS_EX_APPWINDOW);
+            let panel=create(600,300,300,200,Some(&host),WS_EX_TOOLWINDOW);
+            let path=std::env::current_exe().unwrap();
+            let mut settings=crate::model::Settings::default();
+            settings.browser_minimal=true;
+            settings.avoid_apps.push((path.to_string_lossy().into_owned(),"测试宿主".into()));
+            let last=std::cell::Cell::new(None);
+            let poll=|window,settings:&crate::model::Settings| avoidance_for_window(window,island,GetCurrentProcessId(),settings,&last);
+            let results=[poll(host,&settings),poll(panel,&settings),poll(host,&settings)];
+            let detached=create(600,300,300,200,None,WS_EX_TOOLWINDOW);
+            let nested=create(700,400,100,100,Some(&panel),WS_EX_TOOLWINDOW);
+            assert_eq!(poll(detached,&settings),Some(true),"无 owner 的同进程工具窗沿用刚获得焦点的主窗口");
+            assert_eq!(poll(nested,&settings),Some(true),"嵌套插件对话框应找到宿主");
+            assert_eq!(avoidance_for_window(panel,island,0,&settings,&last),Some(true),"面板进程不可识别时仍可通过所有者识别宿主");
+            let independent=create(600,300,300,200,None,WS_EX_APPWINDOW);
+            last.set(None);
+            assert_eq!(poll(detached,&settings),Some(false),"两个可见主窗且无法确定宿主时，不借用后台窗口");
+            let small=poll(independent,&settings);
+            assert_eq!(poll(detached,&settings),Some(false),"当前主窗不遮岛时不能借用同进程另一个大窗");
+            SetWindowPos(independent,HWND_BOTTOM,-9700,-9995,96,80,SWP_NOACTIVATE).unwrap();
+            assert_eq!(poll(independent,&settings),Some(true),"小窗确实遮住岛时也要避让");
+            assert_eq!(poll(host,&settings),Some(true));
+
+            SetWindowPos(host,HWND_BOTTOM,-8000,-10000,1920,1080,SWP_NOACTIVATE).unwrap();
+            let other_screen=[poll(host,&settings),poll(panel,&settings)];
+            SetWindowPos(panel,HWND_TOP,-9700,-9995,96,80,SWP_NOACTIVATE).unwrap();
+            assert_eq!(poll(panel,&settings),Some(true),"宿主在副屏时，浮窗自身遮住岛也应避让");
+            SetWindowPos(panel,HWND_TOP,-9400,-9700,300,200,SWP_NOACTIVATE).unwrap();
+            SetWindowPos(host,HWND_BOTTOM,-10000,-10000,1920,1080,SWP_NOACTIVATE).unwrap();
+            let _=ShowWindow(host,SW_SHOWMINNOACTIVE);
+            assert!(IsIconic(host).as_bool());
+            let minimized=poll(host,&settings);
+            let minimized_owner=poll(panel,&settings);
+            let _=ShowWindow(host,SW_SHOWNOACTIVATE);
+            let _=ShowWindow(panel,SW_HIDE);
+            let hidden=poll(panel,&settings);
+            let _=ShowWindow(panel,SW_SHOWNOACTIVATE);
+            settings.browser_minimal=false;
+            let disabled=poll(panel,&settings);
+            settings.browser_minimal=true;
+            settings.avoid_apps.clear();
+            let removed=poll(panel,&settings);
+            DestroyWindow(detached).unwrap();
+            DestroyWindow(independent).unwrap();
+            DestroyWindow(host).unwrap();
+            DestroyWindow(island).unwrap();
+            assert_eq!(results,[Some(true);3],"焦点从宿主切到中央插件浮窗再切回时应持续避让");
+            assert_eq!(small,Some(false),"同进程的独立小窗只检查自己的位置");
+            assert_eq!(other_screen,[Some(false);2],"主窗口移到副屏后，浮窗也应停止避让");
+            assert_eq!([minimized,minimized_owner,hidden],[Some(false);3],"收起或隐藏的应用窗口应结束避让");
+            assert_eq!((disabled,removed),(Some(false),Some(false)));
+        }
+    }
     #[test]
     fn avoidance_respects_master_browser_switch_and_custom_app_identity() {
         let mut settings=crate::model::Settings::default();

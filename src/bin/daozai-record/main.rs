@@ -443,6 +443,8 @@ fn main() {
             network: None,
             cursor: Some(cursor),
             idle_seconds:None,
+            screen_locked:false,
+            fullscreen_hidden:false,
             browser_at_top:None,
             media: media.np.clone(),
             volume: Some((62, false)),
@@ -534,7 +536,7 @@ fn gallery() {
     let (root,_)=setup_data();
     let dest=std::env::args().nth(2).unwrap_or_else(||"preview".into());
     std::fs::create_dir_all(&dest).unwrap();
-    for scene in 0..18 {
+    for scene in 0..23 {
         let ctx=egui::Context::default();
         let mut app=App::new(&ctx,Options{fetch_lyrics:false,pet_idle:45.0});
         app.settings.pet=true;
@@ -548,6 +550,11 @@ fn gallery() {
             if scene==15 && frame==0 {app.alert("系统音量","音量 67%",5,false);}
             if scene==16 {app.settings.minimal=true;}
             if scene==17 && frame==0 {app.receive_notification("聊天应用".into(),"whatsapp.preview".into(),"你好，下午见".into());}
+            if scene==18 && frame>0 {app.show_sit_view(42.0);}
+            if scene==19 && frame==0 {app.alert(daozai::app::SIT_TITLE,"已连续坐了 60 分钟",2,false);}
+            if scene==20 && frame==1 {app.show_sit_view(42.0);app.open_settings_category(1);}
+            if scene==21 && frame>0 {app.show_sit_view(65.0);}
+            if scene==22 && frame==1 {app.open_settings_category(1);app.show_health_time();}
             let idle=if scene==7{60.0}else if scene==8{200.0}else{0.0};
             let env=Env{t,clock:"10:28:00".into(),today:"2026-10-28".into(),date:"10月28日 周三".into(),battery:Some(76),charging:true,cursor:if scene<6{Some(Pos2::new(320.0,60.0))}else{None},idle_seconds:Some(idle),..Default::default()};
             let raw=egui::RawInput{screen_rect:Some(Rect::from_min_size(Pos2::ZERO,Vec2::new(640.0,190.0))),time:Some(t),viewports:std::iter::once((egui::ViewportId::ROOT,egui::ViewportInfo{native_pixels_per_point:Some(2.0),..Default::default()})).collect(),..Default::default()};

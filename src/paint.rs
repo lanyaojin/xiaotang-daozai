@@ -75,8 +75,10 @@ impl<'a> Card<'a> {
     pub fn font(&self, size: f32, w: W) -> FontId {
         font(size * self.s, w)
     }
+    /// 测量、绘制、截断、折行都经过这里：维语等从右往左的文字在这里做连写和方向转换（#200）。
+    /// 截断（`fit`）按阅读顺序截、再转换，省略号自然落在从右往左阅读的末尾（最左边）。
     pub fn galley(&self, t: &str, size: f32, w: W, color: Color32) -> std::sync::Arc<egui::Galley> {
-        self.painter.layout_no_wrap(t.to_owned(), self.font(size, w), color)
+        self.painter.layout_no_wrap(crate::rtl_text::display(t).into_owned(), self.font(size, w), color)
     }
     pub fn text_w(&self, t: &str, size: f32, w: W) -> f32 {
         self.galley(t, size, w, Color32::WHITE).size().x / self.s
@@ -289,6 +291,34 @@ pub fn alpha(c: Color32, a: f32) -> Color32 {
 mod gradient_tests {
     use super::*;
     #[test]
+    fn regression_play_icon_has_no_internal_seam() {
+        for ppp in [1.0,1.25,1.5,2.0] {
+            for scale in [0.9,1.0,1.4] {
+                for offset in [0.0,0.25,0.5,0.75] {
+                    for (size,color) in [11.0,15.0].into_iter().flat_map(|size|[Color32::WHITE,Color32::from_gray(22),Color32::from_white_alpha(128)].map(|color|(size,color))) {
+                        let ctx=egui::Context::default();ctx.set_zoom_factor(ppp);
+                        let center=Pos2::new(30.0+offset,26.0+offset);
+                        let raw=egui::RawInput{screen_rect:Some(Rect::from_min_size(Pos2::ZERO,Vec2::splat(64.0))),..Default::default()};
+                        let output=ctx.run(raw,|ctx|{egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx,|ui|{
+                            let card=Card::new(ui,Pos2::ZERO,ui.max_rect()).scaled(center.x,center.y,scale);
+                            play_pause(&card,center.x,center.y,size,0.0,color);
+                        });});
+                        let mut raster=crate::preview_raster::Raster::new((64.0*ppp) as usize,(64.0*ppp) as usize);
+                        raster.update_textures(&output.textures_delta);
+                        raster.draw(&ctx.tessellate(output.shapes,ppp),ppp);
+                        let y=(center.y*ppp).floor() as usize;
+                        for dx in [-0.5,0.0,0.5,1.0,1.5] {
+                            let x=((center.x+dx*scale)*ppp).floor() as usize;
+                            let expected=color.a() as f32/255.0;
+                            assert!((raster.buf[y*raster.w+x][3]-expected).abs()<0.02,"播放三角形内部应连续：ppp={ppp}, scale={scale}, offset={offset}, dx={dx}, alpha={}",raster.buf[y*raster.w+x][3]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn long_email_links_do_not_create_hundreds_of_layouts() {
         let ctx=egui::Context::default();
         let text=format!("https://example.com/{}","newsletter-link-".repeat(40));
@@ -416,6 +446,11 @@ pub fn play_pause(c: &Card, cx: f32, cy: f32, size: f32, t: f32, color: Color32)
     let l = |a: (f32, f32), b: (f32, f32)| (cx + a.0 + (b.0 - a.0) * t, cy + a.1 + (b.1 - a.1) * t);
     // 三角拆成左梯形 + 右三角，与两根竖条一一对应插值
     let dx = w * 0.08 * (1.0 - t); // 三角视觉重心右移
+    if t==0.0 {
+        // 静止播放态画完整三角形，公共边不能被两块图形分别羽化。
+        c.poly(&[(cx-w/2.0+dx,cy-h/2.0),(cx+w/2.0+dx,cy),(cx-w/2.0+dx,cy+h/2.0)],color);
+        return;
+    }
     let left = [
         l((-w / 2.0 + dx, -h / 2.0), (-w / 2.0, -h / 2.0)),
         l((dx, -h / 4.0), (-w / 2.0 + bw, -h / 2.0)),
@@ -513,6 +548,26 @@ pub fn target(c: &Card, x: f32, y: f32, color: Color32) {
     c.ring(x, y, 2.4, 1.1, color);
     c.seg((x, y), (x + 5.2, y - 5.2), 1.2, color);
     c.poly(&[(x + 5.6, y - 7.4), (x + 7.4, y - 5.6), (x + 4.4, y - 4.4)], color);
+}
+
+/// 办公椅（久坐提醒的图标）：侧面的实心转椅——微微后仰的靠背、扶手、坐垫、气压杆、带滚轮的底座。
+/// 和水滴一样是物体图标，宽约 24k、高约 30k，(x,y) 为中心。
+pub fn chair(c: &Card, x: f32, y: f32, k: f32, color: Color32) {
+    let p = |dx: f32, dy: f32| (x + dx * k, y + dy * k);
+    let bar = |a: (f32, f32), b: (f32, f32), w: f32| {
+        c.seg(p(a.0, a.1), p(b.0, b.1), w * k, color);
+        c.circle(p(a.0, a.1).0, p(a.0, a.1).1, w * k * 0.5, color);
+        c.circle(p(b.0, b.1).0, p(b.0, b.1).1, w * k * 0.5, color);
+    };
+    bar((-9.0, -13.0), (-7.0, 0.5), 5.0);        // 靠背
+    bar((-7.0, 2.0), (8.5, 2.0), 4.6);           // 坐垫
+    bar((-4.0, -4.5), (5.0, -4.5), 2.2);         // 扶手
+    bar((3.5, -4.5), (3.5, 0.0), 2.2);           // 扶手支撑
+    bar((0.5, 4.0), (0.5, 10.0), 2.6);           // 气压杆
+    bar((-9.0, 11.0), (10.0, 11.0), 2.4);        // 底座
+    for dx in [-9.0f32, 10.0] {                  // 滚轮
+        c.circle(x + dx * k, y + 14.0 * k, 2.0 * k, color);
+    }
 }
 
 pub fn droplet(c: &Card, cx: f32, cy: f32, size: f32, color: Color32) {

@@ -1,6 +1,6 @@
 //! 系统文件缩略图 / 图标。
 //!
-//! 优先用 `IShellItemImageFactory` 取 96 px 缩略图（图片显示真实缩略图，与资源管理器一致），
+//! 文件夹用系统图标，其余文件优先用 `IShellItemImageFactory` 取 96 px 内容缩略图，
 //! 失败再用 `SHGetFileInfoW` 取 32 px 大图标；都失败返回 `None`，界面改画矢量文件图标。
 
 use eframe::egui::{self,ColorImage};
@@ -57,8 +57,10 @@ impl Cache {
 }
 
 fn load_preview(path:&Path)->Loaded {
-    let metadata=std::fs::metadata(path).map(|metadata|if metadata.is_dir(){"文件夹".into()}else{crate::model::human_size(metadata.len())}).unwrap_or_else(|_|"已移动".into());
-    Loaded{image:file_icon(path),metadata}
+    let info=std::fs::metadata(path);
+    let is_dir=info.as_ref().is_ok_and(|metadata|metadata.is_dir());
+    let metadata=info.map(|metadata|if is_dir{"文件夹".into()}else{crate::model::human_size(metadata.len())}).unwrap_or_else(|_|"已移动".into());
+    Loaded{image:file_icon(path,is_dir),metadata}
 }
 
 fn preview_image(width:usize,height:usize,pixels:Vec<u8>)->Option<ColorImage>{
@@ -68,18 +70,20 @@ fn preview_image(width:usize,height:usize,pixels:Vec<u8>)->Option<ColorImage>{
 }
 
 #[cfg(windows)]
-fn file_icon(path: &Path) -> Option<ColorImage> {
+fn file_icon(path: &Path, is_dir: bool) -> Option<ColorImage> {
+    use windows::Win32::UI::Shell::{SIIGBF_ICONONLY,SIIGBF_RESIZETOFIT,SIIGBF_BIGGERSIZEOK};
     if !path.exists() {
         return None;
     }
-    if let Some((w, h, px)) = thumbnail(path, 96) {
+    let flags=if is_dir{SIIGBF_ICONONLY}else{SIIGBF_RESIZETOFIT|SIIGBF_BIGGERSIZEOK};
+    if let Some((w, h, px)) = thumbnail(path, 96, flags) {
         return preview_image(w,h,px);
     }
     shell_icon(path)
 }
 
 #[cfg(windows)]
-fn thumbnail(path: &Path, size: i32) -> Option<(usize, usize, Vec<u8>)> {
+fn thumbnail(path: &Path, size: i32, flags: windows::Win32::UI::Shell::SIIGBF) -> Option<(usize, usize, Vec<u8>)> {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::SIZE;
@@ -88,14 +92,14 @@ fn thumbnail(path: &Path, size: i32) -> Option<(usize, usize, Vec<u8>)> {
         DIB_RGB_COLORS, HGDIOBJ,
     };
     use windows::Win32::UI::Shell::{
-        IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_BIGGERSIZEOK, SIIGBF_RESIZETOFIT,
+        IShellItemImageFactory, SHCreateItemFromParsingName,
     };
 
     let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
     wide.push(0);
     unsafe {
         let factory: IShellItemImageFactory = SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).ok()?;
-        let hbmp = factory.GetImage(SIZE { cx: size, cy: size }, SIIGBF_RESIZETOFIT | SIIGBF_BIGGERSIZEOK).ok()?;
+        let hbmp = factory.GetImage(SIZE { cx: size, cy: size }, flags).ok()?;
         let mut bm = BITMAP::default();
         let got = GetObjectW(
             HGDIOBJ(hbmp.0),
@@ -214,7 +218,7 @@ fn shell_icon(path: &Path) -> Option<ColorImage> {
 }
 
 #[cfg(not(windows))]
-fn file_icon(_path: &Path) -> Option<ColorImage> {
+fn file_icon(_path: &Path, _is_dir: bool) -> Option<ColorImage> {
     None
 }
 
@@ -222,6 +226,30 @@ fn file_icon(_path: &Path) -> Option<ColorImage> {
 mod tests {
     use super::*;
     use std::time::{Duration,Instant};
+    #[cfg(windows)]
+    #[test]
+    fn folders_use_system_icons_and_images_keep_content_thumbnails(){
+        use windows::Win32::System::Com::{CoInitializeEx,CoUninitialize,COINIT_APARTMENTTHREADED};
+        use windows::Win32::UI::Shell::{SIIGBF_ICONONLY,SIIGBF_RESIZETOFIT,SIIGBF_BIGGERSIZEOK};
+        let initialized=unsafe{CoInitializeEx(None,COINIT_APARTMENTTHREADED).is_ok()};
+        let dir=std::env::temp_dir().join(format!("daozai-folder-icons-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir(&dir).unwrap();
+        let picture=dir.join("preview.png");
+        image::RgbaImage::from_pixel(80,40,image::Rgba([230,70,40,255])).save(&picture).unwrap();
+        let cases=[(&dir,SIIGBF_ICONONLY),(&picture,SIIGBF_RESIZETOFIT|SIIGBF_BIGGERSIZEOK)];
+        let previews:Vec<_>=cases.into_iter().map(|(path,flags)|{
+            let (w,h,pixels)=thumbnail(path,96,flags).unwrap();
+            (load_preview(path).image.unwrap(),preview_image(w,h,pixels).unwrap())
+        }).collect();
+        std::fs::remove_file(&picture).unwrap();std::fs::remove_dir(&dir).unwrap();
+        if initialized{unsafe{CoUninitialize();}}
+        for ((actual,expected),kind) in previews.into_iter().zip(["文件夹系统图标","图片内容缩略图"]){
+            assert!(actual.size[0]<=96&&actual.size[1]<=96,"{kind}不能上传大图");
+            assert_eq!(actual.size,expected.size,"{kind}尺寸不符");
+            assert!(actual.pixels==expected.pixels,"{kind}应使用对应的系统图像");
+        }
+    }
+
     #[test]
     fn oversized_shell_thumbnails_are_reduced_before_upload(){
         let preview=preview_image(1024,512,vec![255;1024*512*4]).unwrap();

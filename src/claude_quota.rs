@@ -65,7 +65,7 @@ fn desktop_record(path:&Path,account:Option<&Account>,verified_cache:&Path)->Res
     let mut snapshot=Snapshot{at:sample["t"].as_i64().unwrap()/1000,..Default::default()};
     for (key,label,seconds) in [("fh","5 小时",18000),("sd","本周",604800)]{
         if let Some(used)=sample["u"][key].as_f64().filter(|n|n.is_finite()&&(0.0..=100.0).contains(n)){
-            snapshot.windows.push(Window{label:label.into(),seconds:Some(seconds),remaining:(100.0-used) as f32,reset:None});
+            snapshot.windows.push(Window{label:label.into(),seconds:Some(seconds),remaining:(100.0-used) as f32,reset:None,amount:None});
         }
     }
     // 历史和浏览器缓存均按组织保存。账号配置较新时，只能回显岛仔已为该账号核验过的快照。
@@ -102,7 +102,7 @@ pub(super) fn fetch(account:&Account)->Result<Snapshot,String>{
             if let Some(used)=window["used_percentage"].as_f64().filter(|n|n.is_finite()&&(0.0..=100.0).contains(n)){
                 let reset=window["resets_at"].as_i64().filter(|t|*t>0);
                 if reset.is_some_and(|t|t<=chrono::Utc::now().timestamp()){continue;}
-                snapshot.windows.push(Window{label:label.into(),seconds:Some(seconds),remaining:(100.0-used) as f32,reset});
+                snapshot.windows.push(Window{label:label.into(),seconds:Some(seconds),remaining:(100.0-used) as f32,reset,amount:None});
             }
         }
         if snapshot.windows.is_empty(){return Err("尚无有效的 Claude Code 本地额度，等待下一次使用".into());}

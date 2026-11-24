@@ -28,15 +28,16 @@ unsafe fn matches_player(hwnd:HWND,source:&str)->bool{
 }
 
 unsafe fn window(source:&str)->Option<HWND>{
-    struct Search<'a>{source:&'a str,found:Option<HWND>}
+    struct Search<'a>{source:&'a str,apple:bool,found:Option<HWND>}
     unsafe extern "system" fn visit(hwnd:HWND,param:LPARAM)->BOOL{
         let search=&mut *(param.0 as *mut Search<'_>);
-        let mut class=[0u16;80];let n=GetClassNameW(hwnd,&mut class);
-        let class=String::from_utf16_lossy(&class[..n.max(0)as usize]);
-        if class=="TXGuiFoundation" && IsWindowVisible(hwnd).as_bool() && GetWindow(hwnd,GW_OWNER).is_err() && GetWindowTextLengthW(hwnd)>0 && matches_player(hwnd,search.source){search.found=Some(hwnd);return BOOL(0);}
+        let mut name=[0u16;80];let n=if search.apple{GetWindowTextW(hwnd,&mut name)}else{GetClassNameW(hwnd,&mut name)};
+        let name=String::from_utf16_lossy(&name[..n.max(0)as usize]);
+        if name==(if search.apple{"Apple Music"}else{"TXGuiFoundation"}) && IsWindowVisible(hwnd).as_bool() && GetWindow(hwnd,GW_OWNER).is_err() && GetWindowTextLengthW(hwnd)>0 && matches_player(hwnd,search.source){search.found=Some(hwnd);return BOOL(0);}
         BOOL(1)
     }
-    let mut search=Search{source,found:None};let _=EnumWindows(Some(visit),LPARAM(&mut search as *mut _ as isize));search.found
+    let apple=super::apple_music::is_source(source);
+    let mut search=Search{source:if apple{"AppleMusic.exe"}else{source},apple,found:None};let _=EnumWindows(Some(visit),LPARAM(&mut search as *mut _ as isize));search.found
 }
 
 unsafe fn qq_bar(ui:&IUIAutomation,root:&IUIAutomationElement,duration:f64)->Option<IUIAutomationElement>{
@@ -59,15 +60,39 @@ unsafe fn qq_bar(ui:&IUIAutomation,root:&IUIAutomationElement,duration:f64)->Opt
     None
 }
 
+unsafe fn automation()->Option<IUIAutomation>{
+    let ui:IUIAutomation=CoCreateInstance(&CUIAutomation8,None,CLSCTX_INPROC_SERVER).ok()?;
+    if let Ok(timed)=ui.cast::<IUIAutomation2>(){let _=timed.SetConnectionTimeout(800);let _=timed.SetTransactionTimeout(800);}
+    Some(ui)
+}
+unsafe fn apple_bar(ui:&IUIAutomation,root:&IUIAutomationElement)->Option<IUIAutomationRangeValuePattern>{
+    let condition=ui.CreatePropertyCondition(UIA_AutomationIdPropertyId,&VARIANT::from("LCDScrubber")).ok()?;
+    root.FindFirst(TreeScope_Descendants,&condition).ok()?.GetCurrentPattern(UIA_RangeValuePatternId).ok()?.cast().ok()
+}
+fn apple_value(range:&IUIAutomationRangeValuePattern,duration:f64)->Option<(f64,f64)>{
+    unsafe {
+        let (min,max,value)=(range.CurrentMinimum().ok()?,range.CurrentMaximum().ok()?,range.CurrentValue().ok()?);
+        (duration.is_finite() && duration>0.0 && min==0.0 && max.is_finite() && (max-duration).abs()<1.5
+            && value.is_finite() && (min..=max).contains(&value)).then_some((value,max))
+    }
+}
 pub(super) fn seek(source:&str,position:f64,duration:f64)->bool{
-    if !source.eq_ignore_ascii_case("qqmusic.exe"){return false;}
+    let apple=super::apple_music::is_source(source);
+    if !apple && !super::is_qqmusic(source){return false;}
+    // 窗口按进程映像名核对：新版的会话身份名（Tencent.QQMusic）不是文件名，统一换成 QQMusic.exe。
+    let source=if apple {source} else {"QQMusic.exe"};
     unsafe { (||->Option<()> {
         let _dpi=DpiContext(SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2));
         let hwnd=window(source)?;
         if !IsWindowEnabled(hwnd).as_bool(){return None;}
-        let ui:IUIAutomation=CoCreateInstance(&CUIAutomation8,None,CLSCTX_INPROC_SERVER).ok()?;
-        if let Ok(timed)=ui.cast::<IUIAutomation2>(){let _=timed.SetConnectionTimeout(800);let _=timed.SetTransactionTimeout(800);}
+        let ui=automation()?;
         let root=ui.ElementFromHandle(hwnd).ok()?;
+        if apple {
+            let range=apple_bar(&ui,&root)?;let (_,max)=apple_value(&range,duration)?;
+            if range.CurrentIsReadOnly().ok()?.as_bool() || !position.is_finite() || !(0.0..=max).contains(&position){return None;}
+            // 直接设置原生滑块；无需移动鼠标、激活窗口或扫描歌词区域。
+            return range.SetValue(position).ok();
+        }
         let bar=qq_bar(&ui,&root,duration)?;
         let target=hwnd;
         // 坐标来自无障碍控件，不依赖窗口位置；不移动鼠标，也不激活播放器。

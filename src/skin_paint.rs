@@ -167,14 +167,19 @@ pub fn map_color(color: Color32, p: &Palette) -> Color32 {
 /// 直接改写图形里**已经生效**的颜色（包括文字每个字形的顶点色），所以淡入淡出
 /// 乘进去的透明度、一段文字里的多种颜色都会原样保留。
 pub fn recolor(shape: &mut Shape, p: &Palette) {
+    recolor_with(shape, p, map_color)
+}
+
+/// 同 `recolor`，但用指定的换色函数。
+fn recolor_with(shape: &mut Shape, p: &Palette, tone: Tone) {
     let palette = *p;
     let adjust = move |c: &mut Color32| {
         if *c != Color32::PLACEHOLDER {
-            *c = map_color(*c, &palette);
+            *c = tone(*c, &palette);
         }
     };
     match shape {
-        Shape::Vec(shapes) => shapes.iter_mut().for_each(|s| recolor(s, p)),
+        Shape::Vec(shapes) => shapes.iter_mut().for_each(|s| recolor_with(s, p, tone)),
         // 带纹理的网格是图片（专辑封面、图标），保持原样；单色图标照常换色。
         Shape::Mesh(mesh) if mesh.texture_id != egui::TextureId::default() && !is_monochrome(mesh.texture_id) => {}
         // 带纹理的矩形同理，只换描边。
@@ -220,11 +225,42 @@ fn light_neutral(shape: &Shape) -> bool {
     max - min < 0.12 && luma(c) > 0.8
 }
 
+/// 换色函数：输入按深色主题画的颜色，输出该皮肤下的颜色。
+pub type Tone = fn(Color32, &Palette) -> Color32;
+
+/// 本帧登记过自带配色的图形区段：(图层, 起, 止, 换色函数)，附带登记时的帧号，跨帧自动作废。
+#[derive(Clone, Default)]
+struct Toned { pass: u64, spans: Vec<(egui::LayerId, usize, usize, Tone)> }
+
+fn toned_id() -> egui::Id { egui::Id::new("skin-paint-toned") }
+
+/// 把 `from` 起到当前为止画在 `layer` 上的图形登记为自带配色：换肤时改用 `tone`，
+/// 不走通用的「彩色逐步加深」。用于天气图标这类本身就有浅色版配色的插画式图形。
+pub fn tone_since(ctx: &egui::Context, layer: egui::LayerId, from: usize, tone: Tone) {
+    let to = shape_count(ctx, layer);
+    if to <= from { return; }
+    let pass = ctx.cumulative_pass_nr();
+    ctx.data_mut(|d| {
+        let list = d.get_temp_mut_or_default::<Toned>(toned_id());
+        if list.pass != pass { list.pass = pass; list.spans.clear(); }
+        list.spans.push((layer, from, to, tone));
+    });
+}
+
+fn toned_spans(ctx: &egui::Context, layer: egui::LayerId) -> Vec<(usize, usize, Tone)> {
+    let pass = ctx.cumulative_pass_nr();
+    ctx.data(|d| d.get_temp::<Toned>(toned_id()))
+        .filter(|list| list.pass == pass)
+        .map(|list| list.spans.iter().filter(|s| s.0 == layer).map(|s| (s.1, s.2, s.3)).collect())
+        .unwrap_or_default()
+}
+
 /// 给某个图层中 `ranges` 范围内的图形换色。
 ///
 /// 先找出这些范围里的实心彩色底块；之后画在它们上面的白字、白色图标保持白色
 /// （「保存」按钮、播放键里的三角、开关的滑块），其余照常换色。
 pub fn recolor_layer(ctx: &egui::Context, layer: egui::LayerId, ranges: &[(usize, usize)], p: &Palette) {
+    let toned = toned_spans(ctx, layer);
     ctx.graphics_mut(|g| {
         let list = g.entry(layer);
         let end = list.next_idx().0;
@@ -238,6 +274,10 @@ pub fn recolor_layer(ctx: &egui::Context, layer: egui::LayerId, ranges: &[(usize
         }
         for &(from, to) in ranges {
             for i in from..to.min(end) {
+                if let Some(&(_, _, tone)) = toned.iter().rev().find(|&&(a, b, _)| i >= a && i < b) {
+                    list.mutate_shape(egui::layers::ShapeIdx(i), |s| recolor_with(&mut s.shape, p, tone));
+                    continue;
+                }
                 list.mutate_shape(egui::layers::ShapeIdx(i), |s| {
                     if !fills.is_empty() && light_neutral(&s.shape) {
                         let center = s.shape.visual_bounding_rect().center();

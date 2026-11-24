@@ -17,6 +17,8 @@ pub const BLUE_DEEP: Color32 = Color32::from_rgb(13, 69, 128);
 pub const CYAN: Color32 = Color32::from_rgb(102, 219, 255);
 pub const SOFT_GREEN: Color32 = Color32::from_rgb(118, 196, 151);
 pub const GREEN: Color32 = Color32::from_rgb(48, 209, 88);
+/// 健康页「久坐」模式的主色（与喝水的蓝成对）。
+pub const SIT_GREEN: Color32 = Color32::from_rgb(70, 200, 125);
 pub const CHARGE: Color32 = Color32::from_rgb(33, 235, 84);
 pub const WHITE: Color32 = Color32::WHITE;
 pub const GRAY: Color32 = Color32::from_rgb(178, 178, 186);
@@ -112,6 +114,14 @@ pub fn load_fonts(ctx: &egui::Context) {
     ctx.set_fonts(shared_fonts().clone());
 }
 
+/// 测试导出「修复前」对照图：去掉藏文字体后的字体表。
+#[cfg(test)]
+pub(crate) fn fonts_without_tibetan()->FontDefinitions {
+    let mut fonts=shared_fonts().clone();
+    for list in fonts.families.values_mut() {list.retain(|key|key!="tibetan");}
+    fonts
+}
+
 fn shared_fonts()->&'static FontDefinitions {
     static FONTS:std::sync::OnceLock<FontDefinitions>=std::sync::OnceLock::new();
     FONTS.get_or_init(build_fonts)
@@ -143,6 +153,9 @@ fn font_bytes(path:&Path)->Option<&'static [u8]>{
     Some(Box::leak(std::fs::read(path).ok()?.into_boxed_slice()))
 }
 
+/// 微软喜马拉雅体的字形比同字号的中文小一圈，放大后藏文与中文、英文大致等高。
+const TIBETAN_SCALE: f32 = 1.35;
+
 fn build_fonts()->FontDefinitions {
     let dirs = font_dirs();
     let latin = [
@@ -160,6 +173,10 @@ fn build_fonts()->FontDefinitions {
         find(&[("malgun.ttf", 0), ("NotoSansKR-Regular.otf", 0), ("NotoSansCJK-Regular.ttc", 1)], &dirs),
         find(&[("malgunbd.ttf", 0), ("malgun.ttf", 0), ("NotoSansKR-Bold.otf", 0), ("NotoSansCJK-Bold.ttc", 1)], &dirs),
     ];
+
+    // 藏文：前面几种字体都没有藏文字形（#200）。微软喜马拉雅体的下加字、元音符号本身不占宽度、叠在前一个字上，
+    // 不做复杂排版也能拼出常见的叠字；它的字形偏小，放大到与中文大致等高。只有一档字重，三档共用。
+    let tibetan = find(&[("himalaya.ttf", 0), ("NotoSerifTibetan-Regular.ttf", 0), ("NotoSansTibetan-Regular.ttf", 0)], &dirs);
 
     let mut fonts = FontDefinitions::default();
     let mut cache: Vec<(PathBuf, u32, String)> = Vec::new();
@@ -192,6 +209,12 @@ fn build_fonts()->FontDefinitions {
         if let Some(k) = add(&mut fonts, &korean[usize::from(i > 0)], format!("korean{i}")) {
             list.push(k);
         }
+        if let Some(k) = add(&mut fonts, &tibetan, "tibetan".into()) {
+            if let Some(data) = fonts.font_data.get_mut(&k) {
+                if data.tweak.scale == 1.0 { Arc::make_mut(data).tweak.scale = TIBETAN_SCALE; }
+            }
+            list.push(k);
+        }
         list.extend(builtin.iter().cloned());
         fonts.families.insert(fam.clone(), list);
     }
@@ -219,6 +242,26 @@ mod tests {
                 let font=super::font(14.0,weight);
                 for ch in "눈, 코, 입 향기로운 숨을 담은 너의 코 사랑해 眼鼻嘴 TAEYANG ㄱㄴㅏ".chars().filter(|c|!c.is_whitespace()){
                     assert!(ctx.fonts(|f|f.has_glyph(&font,ch)),"缺少字形：{ch}，字体：{font:?}");
+                }
+            }
+        });
+    }
+
+    /// #200：维语歌词转换后用到的连写字形、藏文歌词，在三档字重下都要有字形（不能显示成方框）。
+    #[cfg(windows)]
+    #[test]
+    fn uyghur_and_tibetan_lyrics_have_glyphs_in_all_weights(){
+        let ctx=eframe::egui::Context::default();
+        super::load_fonts(&ctx);
+        // 覆盖维语全部字母：每个字母在词首、词中、词尾、独立各出现一次。
+        let uyghur="سوي گۈ دىگەن شۇنداق بولامدۇ يايرىم سېنى سېغىندىم شۇنچە ئا ئە ب پ ت ج چ خ د ر ز ژ س ش غ ف ق ك گ ڭ ل م ن ھ و ۇ ۆ ۈ ۋ ې ى ي ئ لا بلا بەبە بۆبۆ بڭب بھب بېب بىب";
+        let shown=crate::rtl_text::display(uyghur).into_owned();
+        let tibetan="བཀྲ་ཤིས་བདེ་ལེགས། སྐྱིད་པོ། གྲོགས་པོ། ཁྱེད་རང་།";
+        let _=ctx.run(Default::default(),|ctx|{
+            for weight in [super::W::Regular,super::W::Semibold,super::W::Bold]{
+                let font=super::font(14.0,weight);
+                for ch in shown.chars().chain(tibetan.chars()).filter(|c|!c.is_whitespace()){
+                    assert!(ctx.fonts(|f|f.has_glyph(&font,ch)),"缺少字形：U+{:04X}，字体：{font:?}",ch as u32);
                 }
             }
         });

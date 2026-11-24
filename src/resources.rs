@@ -28,6 +28,8 @@ pub static COVER:Lane=Lane::new("daozai-cover",2);
 pub static LYRICS:Lane=Lane::new("daozai-lyrics",1);
 pub static NATIVE_LYRICS:Lane=Lane::new("daozai-native-lyrics",2);
 pub static CONTROL:Lane=Lane::new("daozai-control",1);
+/// 音量混合器读写；驱动卡住时最多占住这一个线程。
+pub static VOLUME:Lane=Lane::new("daozai-volume",1);
 pub static ASYNC:Lane=Lane::new("winrt-request",4);
 pub static ASYNC_ARTWORK:Lane=Lane::new("winrt-artwork",2);
 static MONITOR:Lane=Lane::new("daozai-diagnostics",1);
@@ -37,6 +39,8 @@ pub static CONTROL_DROPPED:AtomicUsize=AtomicUsize::new(0);
 pub static TEXTURES:AtomicUsize=AtomicUsize::new(0);
 pub static TEXTURE_BYTES:AtomicUsize=AtomicUsize::new(0);
 pub static GALLEYS:AtomicUsize=AtomicUsize::new(0);
+/// 主界面画了多少帧（每次采样后清零）：闲置时本应很低，持续接近 60 帧/秒说明有东西在空转重绘。
+pub static FRAMES:AtomicUsize=AtomicUsize::new(0);
 
 struct Pending { _lease:Lease, ready:Box<dyn Fn()->bool+Send>, after:Instant }
 pub struct PendingRequests(Mutex<Vec<Pending>>);
@@ -132,7 +136,12 @@ fn record(value:Snapshot)->String {
     let mut line=format!("time={now} build={} pid={} private={} working={} handles={} threads={} abnormal={} timeouts={} rejected_data={} control_dropped={} textures={} texture_bytes={} galleys={}",
         option_env!("DAOZAI_BUILD_LABEL").or(option_env!("CARGO_PKG_VERSION")).unwrap_or("test"),std::process::id(),value.private_bytes,value.working_bytes,value.handles,value.threads,value.abnormal(),
         TIMEOUTS.load(Ordering::Relaxed),REJECTED_DATA.load(Ordering::Relaxed),CONTROL_DROPPED.load(Ordering::Relaxed),TEXTURES.load(Ordering::Relaxed),TEXTURE_BYTES.load(Ordering::Relaxed),GALLEYS.load(Ordering::Relaxed));
-    for lane in [&POLLER,&ARTWORK,&COVER,&LYRICS,&NATIVE_LYRICS,&CONTROL,&ASYNC,&ASYNC_ARTWORK,&MONITOR] {
+    // 距上次采样的平均帧率（采样间隔 5～30 秒不等，按实际间隔换算）。
+    static LAST:Mutex<Option<Instant>>=Mutex::new(None);
+    let since=LAST.lock().unwrap_or_else(|e|e.into_inner()).replace(Instant::now()).map(|at|at.elapsed().as_secs_f64());
+    let frames=FRAMES.swap(0,Ordering::Relaxed);
+    let _=write!(line," fps={}",since.filter(|s|*s>0.5).map_or("-".into(),|s|format!("{:.1}",frames as f64/s)));
+    for lane in [&POLLER,&ARTWORK,&COVER,&LYRICS,&NATIVE_LYRICS,&CONTROL,&VOLUME,&ASYNC,&ASYNC_ARTWORK,&MONITOR] {
         let _=write!(line," {}={}/{}/{}/{}",lane.name,lane.active(),lane.limit,lane.started.load(Ordering::Relaxed),lane.denied.load(Ordering::Relaxed));
     }
     line.push('\n');line

@@ -18,6 +18,8 @@ pub(crate) struct Picker {
     rx:Option<Receiver<Result<Vec<Candidate>,String>>>,
     error:String,
     icons:crate::icons::Cache,
+    /// 「全部添加」先进入确认状态，再点一次「确定添加」才真正添加。
+    confirm_all:bool,
 }
 impl Picker {
     fn refresh(&mut self,ctx:&egui::Context) {
@@ -41,10 +43,10 @@ impl Picker {
     pub(crate) fn settings(&mut self,ui:&mut egui::Ui,settings:&mut Settings) {
         settings_label(ui,"自动避让");
         settings_card(ui,|ui|{
-            setting_row(ui,"自动避让","指定应用在前台并遮住岛的位置时，收成细线",&mut settings.browser_minimal);
+            setting_row(ui,"自动避让","下列应用遮住岛时，岛会收成细线",&mut settings.browser_minimal);
             ui.add_enabled_ui(settings.browser_minimal,|ui|{
                 ui.separator();
-                setting_row(ui,"常用浏览器","自动识别 Chrome、Edge、夸克等浏览器",&mut settings.avoid_browsers);
+                setting_row(ui,"常用浏览器","前台浏览器窗口遮住岛时避让",&mut settings.avoid_browsers);
                 ui.separator();
                 crate::extras::settings_control_row(ui,"自定义应用",100.0,|ui|{
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{
@@ -77,7 +79,7 @@ impl Picker {
                 });
                 if let Some(index)=remove{settings.avoid_apps.remove(index);}
                 ui.add_space(5.0);
-                ui.label(egui::RichText::new("无需全屏或最大化；窗口移开或切换应用后恢复。").size(11.0).weak());
+                ui.label(egui::RichText::new("切到插件浮窗时，宿主窗口仍遮住岛就会继续避让。").size(11.0).weak());
             });
         });
     }
@@ -96,10 +98,10 @@ impl Picker {
         }
         let mut close=false;
         let response=egui::Modal::new(egui::Id::new("avoidance-picker"))
-            .frame(egui::Frame::popup(&ctx.style()).inner_margin(20).corner_radius(12.0)).show(ctx,|ui|{
+            .frame(crate::extras::settings_modal_frame(ctx)).backdrop_color(Color32::from_black_alpha(110)).show(ctx,|ui|{
             ui.visuals_mut().override_text_color=Some(crate::settings_theme::color(ctx,Color32::from_gray(235),Color32::from_gray(30)));
             ui.set_width(410.0);
-            ui.heading("添加应用");
+            if crate::extras::settings_modal_title(ui,"添加应用"){close=true;}
             ui.label(egui::RichText::new("选择正在运行的应用，添加后自动记住。").size(12.0).weak());
             ui.add_space(12.0);
             ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("搜索应用或窗口标题").desired_width(f32::INFINITY));
@@ -133,15 +135,40 @@ impl Picker {
                 if ui.add_enabled(self.rx.is_none(),egui::Button::new("刷新列表")).clicked(){self.refresh(ctx);}
             });
             ui.add_space(12.0);
+            // 二次确认：一次添加很多应用，先说清楚数量。
+            if self.confirm_all {
+                let addable=entries.iter().filter(|app|Self::reason(app,settings).is_none()).count();
+                ui.add_space(8.0);
+                egui::Frame::new().fill(crate::settings_theme::color(ctx,Color32::from_rgb(51,41,26),Color32::from_rgb(255,246,230))).corner_radius(8.0).inner_margin(egui::Margin::symmetric(12,10)).show(ui,|ui|{
+                    ui.set_width(ui.available_width());
+                    ui.label(egui::RichText::new(format!("将把当前列表中 {addable} 个应用全部加入自动避让，确定吗？")).size(12.5));
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui|{
+                        if ui.add_sized([88.0,28.0],egui::Button::new("确定添加")).clicked(){
+                            for app in &entries {
+                                if Self::reason(app,settings).is_none(){settings.avoid_apps.push((app.path.clone(),app.name.clone()));}
+                            }
+                            self.confirm_all=false;close=true;
+                        }
+                        if ui.add_sized([72.0,28.0],egui::Button::new("再想想")).clicked(){self.confirm_all=false;}
+                    });
+                });
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{
                 let selected=self.entries.iter().find(|a|self.selected.as_ref().is_some_and(|p|same_app(p,&a.path)) && Self::reason(a,settings).is_none());
                 if ui.add_enabled(selected.is_some(),egui::Button::new("添加").min_size(egui::vec2(72.0,30.0))).clicked(){
                     let app=selected.unwrap();settings.avoid_apps.push((app.path.clone(),app.name.clone()));close=true;
                 }
-                if ui.add_sized([72.0,30.0],egui::Button::new("取消")).clicked(){close=true;}
+                let addable=entries.iter().filter(|app|Self::reason(app,settings).is_none()).count();
+                let can_add_all=self.rx.is_none() && self.error.is_empty() && addable>0;
+                if !self.confirm_all {
+                    if ui.add_enabled(can_add_all,egui::Button::new("全部添加").min_size(egui::vec2(80.0,30.0)))
+                        .on_hover_text("添加当前列表中所有可添加的应用").clicked(){self.confirm_all=true;}
+                }
+                if ui.add_sized([72.0,30.0],egui::Button::new("取消")).clicked(){if self.confirm_all{self.confirm_all=false;}else{close=true;}}
             });
         });
-        if close || response.should_close(){self.open=false;}
+        if close || response.should_close(){self.open=false;self.confirm_all=false;}
     }
 }
 
