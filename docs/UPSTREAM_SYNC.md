@@ -182,3 +182,5 @@ The BLOCKED report above is historical and fully resolved:
 - Local verification: rustfmt syntax OK; std-stub rustc type check 0 errors; cargo metadata/tree --locked OK. No MSVC linker locally.
 - Push: yes, only to origin/presence-v2 (upstream push disabled).
 - Build/CI: **BLOCKED** — GitHub Actions disabled at repo level (dispatch 422, workflows state active but disabled; API re-enable ineffective). No local MSVC toolchain → cannot produce exe. Need repo owner to re-enable Actions in web settings.
+
+<!-- ci-probe 2026-11-24: verify push triggers despite repo state -->
