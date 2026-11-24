@@ -471,7 +471,7 @@ auto_mute_enabled=1   wellness_poi=1
 | 项目 | 值 |
 | --- | --- |
 | 产物构建 | run `45309787071` **completed success**（在场保护单测 + release 构建 + 上传全通过） |
-| Windows 检查 | run `45309786938`：installer job success；test job 运行中（合并后全量测试耗时更长） |
+| Windows 检查 | run `45309786938` **completed success**（10:38）：installer 与 test 两个 job 全部步骤通过；「测试」约 17 分钟、「验证发布构建与打包」约 14 分钟，均因合并后项目变大而耗时增加 |
 | 产物 | `dist/daozai-v066.zip` 11,773,494 B → `dist/v066-extract/daozai.exe` |
 | 安装文件 | **22,881,792 B（21.8 MB）**，SHA256 `be44a29d6eb1a437d7d20d538a6c48182b719b324c962c7532acde10aa9f414f` |
 | 体积结论 | 合并 153 个上游提交后从 19.06 MB 增至 21.8 MB，**仍低于 30 MB 上限** |
